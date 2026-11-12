@@ -30,7 +30,7 @@ import { QuackbackEmbed } from './quackback-embed-extension'
 import { UploadedVideo } from './uploaded-video-node'
 import { Markdown } from '@tiptap/markdown'
 import { Extension, getHTMLFromFragment } from '@tiptap/core'
-import type { Range } from '@tiptap/core'
+import type { Attributes, Range } from '@tiptap/core'
 import Suggestion, { type SuggestionOptions, type SuggestionProps } from '@tiptap/suggestion'
 import { createLowlight } from 'lowlight'
 import langBash from 'highlight.js/lib/languages/bash'
@@ -213,7 +213,7 @@ export function buildExtensions(
     // New inserts still get a measured box from `resizableImageInsertAttrs`.
     ResizableImage.extend({
       addAttributes() {
-        const parent = this.parent?.() ?? {}
+        const parent: Attributes = this.parent?.() ?? {}
         const keepRatio = parent['data-keep-ratio']
         return {
           ...parent,

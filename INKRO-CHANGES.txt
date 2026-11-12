@@ -5,3 +5,5 @@ No automatic translation of user content. License: AGPL-3.0.
 Public source/license footer and exact-commit source packaging added.
 Independent GitHub Actions validation and multi-architecture GHCR publishing.
 Upstream README/workflows retained as references; independent README added.
+Build validation also generates route types before type checking and explicitly
+types inherited editor image attributes without changing runtime behavior.

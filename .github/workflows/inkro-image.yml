@@ -32,6 +32,29 @@ jobs:
           bun-version: 1.4.0
       - run: bun install --frozen-lockfile
       - run: bun run --filter @quackback/widget build
+      - name: Generate route types before checking a clean checkout
+        working-directory: apps/web
+        env:
+          QUACKBACK_BUILD: '1'
+          SKIP_ENV_VALIDATION: 'true'
+        run: |
+          set -euo pipefail
+          bunx vite dev --host 127.0.0.1 --port 4173 > "$RUNNER_TEMP/inkro-route-generation.log" 2>&1 &
+          VITE_PID=$!
+          trap 'kill "$VITE_PID" 2>/dev/null || true; wait "$VITE_PID" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 90); do
+            if test -s src/routeTree.gen.ts; then
+              exit 0
+            fi
+            if ! kill -0 "$VITE_PID" 2>/dev/null; then
+              cat "$RUNNER_TEMP/inkro-route-generation.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/inkro-route-generation.log"
+          echo '::error::Route types were not generated within 90 seconds.'
+          exit 1
       - run: bun run typecheck
       - name: Validate catalogs, selection, persistence and shared UI
         run: >-
@@ -43,6 +66,8 @@ jobs:
           apps/web/src/components/public/__tests__/portal-language-selector.test.tsx
           apps/web/src/components/public/__tests__/portal-header-renders.test.tsx
           apps/web/src/components/ui/__tests__/sonner-label.test.tsx
+          apps/web/src/components/ui/__tests__/rich-text-editor-extensions.test.ts
+          apps/web/src/components/ui/__tests__/rich-text-editor-renders.test.tsx
           apps/web/src/lib/client/hooks/__tests__/use-intl-setup.test.tsx
           --maxWorkers=2
 
