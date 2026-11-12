@@ -1,4 +1,5 @@
 import { useMemo } from 'react'
+import { FormattedMessage } from 'react-intl'
 import { PortalBrandMark } from './portal-brand-mark'
 import { generateWorkspaceThemeCSS } from '@/lib/shared/theme'
 import { escapeInlineStyle } from '@/lib/shared/safe-inline-content'
@@ -57,6 +58,11 @@ export function PortalAuthShell({ heading, subheading, children, footer }: Porta
         </div>
         {children}
         {footer}
+        <p className="text-center text-xs text-muted-foreground">
+          <a href="/inkro-source.html" className="underline-offset-4 hover:underline">
+            <FormattedMessage id="portal.source.label" defaultMessage="Source code and license" />
+          </a>
+        </p>
       </div>
     </div>
   )

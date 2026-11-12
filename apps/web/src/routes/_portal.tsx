@@ -6,7 +6,6 @@ import {
   useRouteContext,
 } from '@tanstack/react-router'
 import { lazy, Suspense } from 'react'
-import { FormattedMessage } from 'react-intl'
 import { createServerFn } from '@tanstack/react-start'
 import { setResponseHeader } from '@tanstack/react-start/server'
 import { fetchUserAvatar } from '@/lib/server/functions/portal'
@@ -416,17 +415,6 @@ function PortalLayout() {
                   <Outlet />
                 </FileViewerProvider>
               </main>
-              <footer className="border-t px-4 py-3 text-center text-xs text-muted-foreground">
-                <a
-                  href="/inkro-source.html"
-                  className="underline underline-offset-4 hover:text-foreground"
-                >
-                  <FormattedMessage
-                    id="portal.source.label"
-                    defaultMessage="Source code & license"
-                  />
-                </a>
-              </footer>
               <AuthDialog authConfig={authConfig} workspaceName={workspaceName} />
             </div>
           </PortalPreviewProvider>

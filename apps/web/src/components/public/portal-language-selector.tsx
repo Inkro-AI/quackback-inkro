@@ -3,6 +3,14 @@ import { useRouteContext, useRouter } from '@tanstack/react-router'
 import { useIntl } from 'react-intl'
 import { LanguageIcon } from '@heroicons/react/24/outline'
 import { toast } from 'sonner'
+import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { cn } from '@/lib/shared/utils'
 import {
   isPortalLanguage,
   portalLanguageCookie,
@@ -47,29 +55,44 @@ export function PortalLanguageSelector() {
   }
 
   return (
-    <label className="portal-language-selector me-1 inline-flex shrink-0 items-center gap-1 rounded-md border border-[var(--header-border)] px-2 py-1.5 text-[var(--header-foreground)]">
-      <LanguageIcon aria-hidden="true" className="h-4 w-4" />
-      <span className="sr-only">{label}</span>
-      <select
-        aria-label={label}
-        value={preference}
-        disabled={pending}
-        onChange={(event) => void changeLanguage(event.target.value)}
-        className="max-w-[7rem] cursor-pointer bg-transparent text-sm outline-offset-2 disabled:opacity-50"
-      >
-        <option value="auto">
-          {intl.formatMessage({ id: 'portal.language.auto', defaultMessage: 'Automatic' })}
-        </option>
-        <option value="sk" lang="sk">
-          Slovenčina
-        </option>
-        <option value="cs" lang="cs">
-          Čeština
-        </option>
-        <option value="en" lang="en">
-          English
-        </option>
-      </select>
-    </label>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="portal-language-selector h-9 w-9"
+          aria-label={label}
+          title={label}
+          disabled={pending}
+        >
+          <LanguageIcon aria-hidden="true" className="h-4 w-4" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        {[
+          {
+            value: 'auto',
+            label: intl.formatMessage({
+              id: 'portal.language.auto',
+              defaultMessage: 'Automatic',
+            }),
+          },
+          { value: 'sk', label: 'Slovenčina', lang: 'sk' },
+          { value: 'cs', label: 'Čeština', lang: 'cs' },
+          { value: 'en', label: 'English', lang: 'en' },
+        ].map((language) => (
+          <DropdownMenuItem
+            key={language.value}
+            onClick={() => void changeLanguage(language.value)}
+            aria-current={preference === language.value ? true : undefined}
+            lang={language.lang}
+            disabled={pending}
+            className={cn(preference === language.value && 'bg-accent')}
+          >
+            {language.label}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }

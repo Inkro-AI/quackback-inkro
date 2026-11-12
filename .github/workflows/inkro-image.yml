@@ -65,6 +65,8 @@ jobs:
           apps/web/src/lib/shared/__tests__/widget-locale-parity.test.ts
           apps/web/src/components/public/__tests__/portal-language-selector.test.tsx
           apps/web/src/components/public/__tests__/portal-header-renders.test.tsx
+          apps/web/src/components/public/__tests__/portal-header.test.tsx
+          apps/web/src/components/auth/__tests__/auth-dialog.test.tsx
           apps/web/src/components/ui/__tests__/sonner-label.test.tsx
           apps/web/src/components/ui/__tests__/rich-text-editor-extensions.test.ts
           apps/web/src/components/ui/__tests__/rich-text-editor-renders.test.tsx

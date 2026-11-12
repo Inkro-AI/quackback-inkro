@@ -82,8 +82,15 @@ async function mount() {
   await act(async () => {
     render(<RouterProvider router={router} />)
   })
-  await screen.findByRole('combobox')
+  await screen.findByRole('button', { name: /^(Jazyk|Language)$/ })
   return router
+}
+
+async function chooseLanguage(name: string) {
+  const trigger = screen.getByRole('button', { name: /^(Jazyk|Language)$/ })
+  await waitFor(() => expect(trigger).not.toBeDisabled())
+  fireEvent.click(trigger)
+  fireEvent.click(await screen.findByRole('menuitem', { name, exact: true }))
 }
 
 describe('portal language selection', () => {
@@ -92,11 +99,9 @@ describe('portal language selection', () => {
     await screen.findByRole('heading', { name: 'Plán vývoja' })
     const draft = screen.getByRole('textbox') as HTMLTextAreaElement
     fireEvent.change(draft, { target: { value: 'Môj rozpísaný nápad' } })
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'cs' } })
+    await chooseLanguage('Čeština')
     await screen.findByRole('heading', { name: 'Plán vývoje' })
-    await waitFor(() =>
-      expect((screen.getByRole('combobox') as HTMLSelectElement).disabled).toBe(false)
-    )
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Jazyk' })).not.toBeDisabled())
     expect(draft.value).toBe('Môj rozpísaný nápad')
     expect(screen.getByRole('textbox')).toBe(draft)
     expect(readPortalLanguagePreference(document.cookie)).toBe('cs')
@@ -104,13 +109,15 @@ describe('portal language selection', () => {
     cleanup()
     await mount()
     await screen.findByRole('heading', { name: 'Plán vývoje' })
-    expect((screen.getByRole('combobox') as HTMLSelectElement).value).toBe('cs')
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'en' } })
-    await screen.findByRole('heading', { name: 'Roadmap' })
-    await waitFor(() =>
-      expect((screen.getByRole('combobox') as HTMLSelectElement).disabled).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Jazyk' }))
+    expect(await screen.findByRole('menuitem', { name: 'Čeština' })).toHaveAttribute(
+      'aria-current',
+      'true'
     )
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'auto' } })
+    fireEvent.click(screen.getByRole('menuitem', { name: 'English' }))
+    await screen.findByRole('heading', { name: 'Roadmap' })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Language' })).not.toBeDisabled())
+    await chooseLanguage('Automatic')
     await screen.findByRole('heading', { name: 'Plán vývoja' })
     expect(readPortalLanguagePreference(document.cookie)).toBe('auto')
   })

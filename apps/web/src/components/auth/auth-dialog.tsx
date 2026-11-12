@@ -162,6 +162,11 @@ export function AuthDialog({ authConfig, workspaceName }: AuthDialogProps) {
             )}
           </p>
         ) : null}
+        <p className="text-center text-xs text-muted-foreground">
+          <a href="/inkro-source.html" className="underline-offset-4 hover:underline">
+            <FormattedMessage id="portal.source.label" defaultMessage="Source code and license" />
+          </a>
+        </p>
       </DialogContent>
     </Dialog>
   )

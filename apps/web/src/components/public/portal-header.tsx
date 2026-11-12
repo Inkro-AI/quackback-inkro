@@ -26,6 +26,7 @@ import { Avatar } from '@/components/ui/avatar'
 import { UserStatsBar } from '@/components/shared/user-stats'
 import {
   ArrowRightStartOnRectangleIcon,
+  CodeBracketIcon,
   Cog6ToothIcon,
   ComputerDesktopIcon,
   MoonIcon,
@@ -185,18 +186,27 @@ export function PortalHeader({
     router.navigate({ to: '/' })
   }
 
+  const sourceCodeMenuItem = (
+    <DropdownMenuItem asChild>
+      <a href="/inkro-source.html">
+        <CodeBracketIcon className="me-2 h-4 w-4" />
+        <FormattedMessage id="portal.source.label" defaultMessage="Source code and license" />
+      </a>
+    </DropdownMenuItem>
+  )
+
   // Auth/admin buttons. Plain elements rather than a component declared in
   // here: a component declared in render is a new type each time, so every
   // render of the header would tear these menus down and build them again.
   const authButtons = (
-    <div className="flex max-w-full flex-wrap items-center justify-end gap-y-2">
+    <div className="flex max-w-full flex-wrap items-center justify-end gap-x-1 gap-y-2">
       <PortalLanguageSelector />
       {/* Theme Toggle (when admin allows user choice) */}
       {showThemeToggle && <ThemeToggle />}
 
       {/* Admin Button (visible for team members) */}
       {canAccessAdmin && (
-        <Button variant="outline" size="sm" asChild className="ms-1 me-2">
+        <Button variant="outline" size="sm" asChild>
           <Link to="/admin" search={{}}>
             <ShieldCheckIcon className="me-2 h-4 w-4" />
             <FormattedMessage id="portal.header.auth.admin" defaultMessage="Admin" />
@@ -205,7 +215,7 @@ export function PortalHeader({
       )}
 
       {/* Notification Bell (logged in users only) */}
-      {isLoggedIn && <NotificationBell popoverSide="bottom" className="me-1" />}
+      {isLoggedIn && <NotificationBell popoverSide="bottom" />}
 
       {/* Auth Buttons */}
       {isLoggedIn ? (
@@ -249,6 +259,7 @@ export function PortalHeader({
                 <FormattedMessage id="portal.header.auth.settings" defaultMessage="Settings" />
               </Link>
             </DropdownMenuItem>
+            {sourceCodeMenuItem}
             <DropdownMenuItem onClick={handleSignOut}>
               <ArrowRightStartOnRectangleIcon className="me-2 h-4 w-4" />
               <FormattedMessage id="portal.header.auth.signOut" defaultMessage="Sign out" />

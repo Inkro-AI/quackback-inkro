@@ -7,3 +7,7 @@ Independent GitHub Actions validation and multi-architecture GHCR publishing.
 Upstream README/workflows retained as references; independent README added.
 Build validation also generates route types before type checking and explicitly
 types inherited editor image attributes without changing runtime behavior.
+Portal controls updated 2026-11-12: compact language icon using the shared menu,
+without selection dots, and a source offer in the account menu and public
+sign-in dialog/pages replacing the permanent footer. Header controls are spaced
+apart, with no additional account icon for signed-out visitors.

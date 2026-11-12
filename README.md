@@ -10,14 +10,14 @@ main Inkro application.
 - 2,266 entries per catalog, including existing admin translations.
 - Admin copy outside the existing catalogs is unchanged.
 - Feedback posts and comments are not automatically translated.
-- Public source/license link and matching source archive in each image.
+- Source/license link in the account menu and public sign-in dialog and matching source archive in each image.
 
 ## License and source
 
 AGPL-3.0; see [LICENSE](LICENSE) and [INKRO-CHANGES.txt](INKRO-CHANGES.txt).
 Upstream notices are preserved. Changes are dated 2026-11-12.
 Network users of the modified service must be offered its corresponding
-source. The portal footer links to `/inkro-source.html`, which offers the
+source. The account menu and public sign-in dialog link to `/inkro-source.html`, which offers the
 matching `/inkro-quackback-source.tar.gz` and license. Keep this source offer
 accessible in deployments, including any additional customized interfaces.
 
