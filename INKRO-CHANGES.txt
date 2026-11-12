@@ -1,0 +1,7 @@
+Inkro localization, 2026-11-12, based on Quackback v0.15.0.
+Complete Slovak/Czech catalogs, SK/CS/EN portal selector, browser detection, one-year host-only preference cookie, and default status labels.
+Admin uses existing catalog keys; hardcoded admin copy is unchanged.
+No automatic translation of user content. License: AGPL-3.0.
+Public source/license footer and exact-commit source packaging added.
+Independent GitHub Actions validation and multi-architecture GHCR publishing.
+Upstream README/workflows retained as references; independent README added.

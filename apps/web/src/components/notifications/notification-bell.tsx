@@ -1,0 +1,115 @@
+'use client'
+
+import { railControlClass } from '@/components/admin/rail-item'
+import { useState, useEffect, useRef } from 'react'
+import { BellIcon } from '@heroicons/react/24/solid'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { useUnreadCount } from '@/lib/client/hooks/use-notifications-queries'
+import { NotificationDropdown } from './notification-dropdown'
+import { cn } from '@/lib/shared/utils'
+import { useOptionalIntl } from '@/components/ui/use-optional-intl'
+
+interface NotificationBellProps {
+  className?: string
+  /** Popover position: 'right' for sidebar, 'bottom' for header */
+  popoverSide?: 'right' | 'bottom'
+  /** Icon + visible label. Default stays icon-only with a tooltip. */
+  labeled?: boolean
+  /** The notifications page is open: draws the rail item in its active state. */
+  active?: boolean
+}
+
+export function NotificationBell({
+  className,
+  popoverSide = 'right',
+  labeled = false,
+  active = false,
+}: NotificationBellProps) {
+  const intl = useOptionalIntl()
+  const title = intl.formatMessage({
+    id: 'portal.notifications.title',
+    defaultMessage: 'Notifications',
+  })
+  const [open, setOpen] = useState(false)
+  const { data: unreadCount = 0 } = useUnreadCount()
+  const [shouldPulse, setShouldPulse] = useState(false)
+  const prevCountRef = useRef(unreadCount)
+
+  // Pulse animation when unread count increases
+  useEffect(() => {
+    if (unreadCount > prevCountRef.current && unreadCount > 0) {
+      setShouldPulse(true)
+      const timer = setTimeout(() => setShouldPulse(false), 1000)
+      return () => clearTimeout(timer)
+    }
+    prevCountRef.current = unreadCount
+  }, [unreadCount])
+
+  const isBottomAligned = popoverSide === 'bottom'
+
+  const trigger = (
+    <PopoverTrigger asChild>
+      <button
+        data-admin-rail-item={labeled ? '' : undefined}
+        data-active={active ? 'true' : undefined}
+        className={cn(
+          labeled
+            ? railControlClass(active)
+            : cn(
+                'relative flex h-10 w-10 items-center justify-center rounded-lg transition-all duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                'text-muted-foreground/70 hover:bg-muted/50 hover:text-foreground',
+                active && 'bg-muted/80 text-foreground'
+              ),
+          className
+        )}
+        aria-label={intl.formatMessage(
+          {
+            id: 'portal.notifications.bell.ariaLabel',
+            defaultMessage: 'Notifications{count, plural, =0 {} other { (# unread)}}',
+          },
+          { count: unreadCount }
+        )}
+      >
+        <BellIcon className="h-5 w-5 shrink-0" />
+        {labeled ? <span className="min-w-0 flex-1 truncate text-left">{title}</span> : null}
+        {unreadCount > 0 && (
+          <span
+            className={cn(
+              labeled
+                ? 'ms-auto flex h-[18px] min-w-[18px] items-center justify-center rounded-full px-1'
+                : 'absolute -top-0.5 -right-0.5 flex h-[18px] min-w-[18px] items-center justify-center rounded-full px-1',
+              'border-2 border-card bg-primary text-[11px] font-semibold text-primary-foreground',
+              shouldPulse && 'animate-pulse'
+            )}
+          >
+            {unreadCount > 99 ? '99+' : unreadCount}
+          </span>
+        )}
+      </button>
+    </PopoverTrigger>
+  )
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      {labeled ? (
+        trigger
+      ) : (
+        <Tooltip>
+          <TooltipTrigger asChild>{trigger}</TooltipTrigger>
+          <TooltipContent side={isBottomAligned ? 'bottom' : 'right'} sideOffset={8}>
+            {title}
+          </TooltipContent>
+        </Tooltip>
+      )}
+      <PopoverContent
+        align={isBottomAligned ? 'end' : 'start'}
+        side={popoverSide}
+        sideOffset={8}
+        className="w-76 p-0"
+      >
+        <NotificationDropdown onClose={() => setOpen(false)} />
+      </PopoverContent>
+    </Popover>
+  )
+}

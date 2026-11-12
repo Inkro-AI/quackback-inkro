@@ -1,0 +1,145 @@
+name: Inkro image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inkro-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  HUSKY: '0'
+  IMAGE: ghcr.io/inkro-ai/quackback-inkro
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Check matching source can be packaged
+        run: python3 scripts/inkro-source-archive.py
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
+      - run: bun run --filter @quackback/widget build
+      - run: bun run typecheck
+      - name: Validate catalogs, selection, persistence and shared UI
+        run: >-
+          bun run test run
+          apps/web/src/locales/__tests__
+          apps/web/src/lib/shared/__tests__/portal-language.test.ts
+          apps/web/src/lib/shared/__tests__/i18n.test.ts
+          apps/web/src/lib/shared/__tests__/widget-locale-parity.test.ts
+          apps/web/src/components/public/__tests__/portal-language-selector.test.tsx
+          apps/web/src/components/public/__tests__/portal-header-renders.test.tsx
+          apps/web/src/components/ui/__tests__/sonner-label.test.tsx
+          apps/web/src/lib/client/hooks/__tests__/use-intl-setup.test.tsx
+          --maxWorkers=2
+
+  build:
+    if: github.event_name != 'pull_request' && github.repository == 'Inkro-AI/quackback-inkro'
+    needs: validate
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            pair: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            pair: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Package corresponding source into the image
+        run: python3 scripts/inkro-source-archive.py
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push platform digest
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.source=https://github.com/Inkro-AI/quackback-inkro
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0
+          cache-from: type=gha,scope=inkro-${{ matrix.pair }}
+          cache-to: type=gha,mode=max,scope=inkro-${{ matrix.pair }}
+      - name: Record platform digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/inkro-digests"
+          touch "$RUNNER_TEMP/inkro-digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: inkro-digest-${{ matrix.pair }}
+          path: ${{ runner.temp }}/inkro-digests/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: ${{ runner.temp }}/inkro-digests
+          pattern: inkro-digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-architecture tag
+        working-directory: ${{ runner.temp }}/inkro-digests
+        env:
+          REVISION: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIGEST_FILES=(*)
+          if [[ ${#DIGEST_FILES[@]} != 2 ]]; then
+            echo '::error::Expected both native platform digests.'
+            exit 1
+          fi
+          REFS=()
+          for digest in "${DIGEST_FILES[@]}"; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+            REFS+=("${IMAGE}@sha256:${digest}")
+          done
+          TAG="${IMAGE}:0.15.0-inkro-${REVISION}"
+          docker buildx imagetools create --tag "$TAG" "${REFS[@]}"
+          docker buildx imagetools inspect "$TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Deployment in Dokploy is a separate action; production was not changed by this workflow.' >> "$GITHUB_STEP_SUMMARY"

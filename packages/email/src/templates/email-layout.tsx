@@ -1,0 +1,122 @@
+import {
+  Body,
+  Container,
+  Head,
+  Html,
+  Img,
+  Preview,
+  Section,
+  Text,
+  Link,
+} from '@react-email/components'
+import { layout, branding, typography, utils, colors, DEFAULT_LOGO_URL } from './shared-styles'
+import { useEmailShowPoweredBy } from '../powered-by'
+
+interface EmailLayoutProps {
+  preview: string
+  logoUrl?: string
+  logoAlt?: string
+  children: React.ReactNode
+  footer?: React.ReactNode
+  /**
+   * Override the process-wide Powered-by flag. Capability-free templates
+   * (no link, no code, no token) pass false so the footer cannot add an anchor.
+   */
+  showPoweredBy?: boolean
+  /** Language of the email's copy (BCP-47), for screen readers and mail clients. */
+  lang?: string
+  /** Text direction of the copy; `rtl` lays the email out right to left. */
+  dir?: 'ltr' | 'rtl'
+}
+
+/**
+ * Shared email layout with proper HTML email best practices:
+ * - Wrapper Section with background color (fallback for clients that strip <body> styles)
+ * - Centered container via React Email's align="center" (no margin:auto)
+ * - Consistent logo, spacing, and footer placement
+ */
+export function EmailLayout({
+  preview,
+  logoUrl,
+  logoAlt = 'Quackback',
+  children,
+  footer,
+  showPoweredBy: showPoweredByOverride,
+  lang,
+  dir,
+}: EmailLayoutProps) {
+  const fromContext = useEmailShowPoweredBy()
+  const showPoweredBy = showPoweredByOverride ?? fromContext
+  return (
+    <Html lang={lang ?? 'en'} dir={dir ?? 'ltr'}>
+      <Head />
+      <Preview>{preview}</Preview>
+      <Body style={layout.main}>
+        {/* Wrapper Section provides background color for clients that strip <body> styles */}
+        <Section style={{ backgroundColor: colors.background }}>
+          {/* dir again here: some clients drop the <html> attributes. */}
+          <Container style={layout.container} dir={dir}>
+            {/* Logo */}
+            <Section style={branding.logoContainer}>
+              <Img
+                src={logoUrl ?? DEFAULT_LOGO_URL}
+                alt={logoAlt}
+                width={branding.logo.width}
+                height={branding.logo.height}
+                style={branding.logo}
+              />
+            </Section>
+
+            {children}
+
+            {/* Footer */}
+            {footer}
+            {showPoweredBy ? (
+              <Text style={typography.footer}>
+                <Link href="https://quackback.io" style={{ ...utils.link, fontSize: '13px' }}>
+                  Powered by Quackback
+                </Link>
+              </Text>
+            ) : null}
+          </Container>
+        </Section>
+      </Body>
+    </Html>
+  )
+}
+
+/** Standard footer for transactional emails (sign-in, password reset, welcome, invitation) */
+export function TransactionalFooter({ children }: { children: React.ReactNode }) {
+  return <Text style={typography.footer}>{children}</Text>
+}
+
+/** Standard footer for notification emails with unsubscribe link */
+export function NotificationFooter({
+  reason,
+  unsubscribeUrl,
+  unsubscribeLabel = 'Unsubscribe from this post',
+  preferencesUrl,
+}: {
+  reason: string
+  unsubscribeUrl: string
+  unsubscribeLabel?: string
+  preferencesUrl?: string
+}) {
+  return (
+    <Text style={typography.footer}>
+      {reason}
+      <br />
+      <Link href={unsubscribeUrl} style={{ ...utils.link, fontSize: '13px' }}>
+        {unsubscribeLabel}
+      </Link>
+      {preferencesUrl ? (
+        <>
+          {' · '}
+          <Link href={preferencesUrl} style={{ ...utils.link, fontSize: '13px' }}>
+            Manage notification preferences
+          </Link>
+        </>
+      ) : null}
+    </Text>
+  )
+}

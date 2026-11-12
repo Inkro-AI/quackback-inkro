@@ -1,0 +1,31 @@
+import { createFileRoute, redirect } from '@tanstack/react-router'
+import { z } from 'zod'
+import { ChangelogList } from '@/components/admin/changelog/changelog-list'
+import { blankOmittedSearchKeys } from '@/lib/shared/route-search'
+import { getFirstEnabledAdminProductPath, isProductEnabled } from '@/lib/shared/types/settings'
+
+const searchSchema = z.object({
+  status: z.enum(['draft', 'scheduled', 'published']).optional().catch(undefined),
+  entry: z.string().optional(), // Entry ID for modal view
+  search: z.string().optional(),
+  sort: z.enum(['newest', 'oldest']).optional().catch(undefined),
+})
+
+export const Route = createFileRoute('/admin/changelog')({
+  validateSearch: (raw: Record<string, unknown>) =>
+    blankOmittedSearchKeys(raw, searchSchema.parse(raw)),
+  beforeLoad: ({ context }) => {
+    if (!isProductEnabled(context.settings?.featureFlags, 'changelog')) {
+      throw redirect({ to: getFirstEnabledAdminProductPath(context.settings?.featureFlags) })
+    }
+  },
+  component: ChangelogPage,
+})
+
+function ChangelogPage() {
+  return (
+    <div className="h-full">
+      <ChangelogList />
+    </div>
+  )
+}

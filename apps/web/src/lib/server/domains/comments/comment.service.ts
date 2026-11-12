@@ -1,0 +1,529 @@
+import {
+  db,
+  eq,
+  and,
+  isNull,
+  sql,
+  postComments,
+  posts,
+  principal,
+  postStatuses,
+  type PostComment,
+  type ModerationState,
+} from '@/lib/server/db'
+import {
+  type PostCommentId,
+  type PrincipalId,
+  type PostStatusId,
+  type UserId,
+} from '@quackback/ids'
+import { NotFoundError, ValidationError, ForbiddenError } from '@/lib/shared/errors'
+import { isTeamMember, Role } from '@/lib/shared/roles'
+import { subscribeToPost } from '@/lib/server/domains/subscriptions/subscription.service'
+import {
+  dispatchCommentUpdated,
+  dispatchCommentDeleted,
+  dispatchPostStatusChanged,
+  buildEventActor,
+} from '@/lib/server/events/dispatch'
+import { dispatchCommentCreatedEvent } from './comment.announce'
+import { prepareCommentContent } from './comment-content'
+import { contentHoldReason } from '@/lib/server/content/content-holds'
+import type { CreateCommentInput, CreateCommentResult, UpdateCommentInput } from './comment.types'
+import { canCreateComment } from '@/lib/server/policy/posts'
+import type { Actor } from '@/lib/server/policy/types'
+import { recordAuditEvent } from '@/lib/server/audit/log'
+import { getPortalConfig } from '@/lib/server/domains/settings/settings.service'
+import { createActivity } from '@/lib/server/domains/activity/activity.service'
+import { logger } from '@/lib/server/logger'
+import { adjustCanonicalCommentCount } from '@/lib/server/domains/posts/post.merge-ids'
+import { isTestCustomer, notTestPrincipal } from '@/lib/server/test-data'
+
+const log = logger.child({ component: 'comments' })
+
+export async function createComment(
+  input: CreateCommentInput,
+  author: {
+    principalId: PrincipalId
+    userId?: UserId
+    name?: string
+    email?: string
+    displayName?: string
+    role: Role
+  },
+  actor: Actor,
+  options?: { skipDispatch?: boolean; headers?: Headers }
+): Promise<CreateCommentResult> {
+  log.info({ post_id: input.postId, parent_id: input.parentId ?? null }, 'create comment')
+  // Validate post exists (and is not deleted) and eagerly load board in single query.
+  // The relational `with: { board: true }` can't push isNull(boards.deletedAt) into
+  // the join, so we filter the soft-deleted case in JS. Surface it as POST_NOT_FOUND
+  // — a public caller doesn't need to distinguish post-not-found from board-deleted.
+  const post = await db.query.posts.findFirst({
+    where: and(eq(posts.id, input.postId), isNull(posts.deletedAt)),
+    with: { board: true },
+  })
+  if (!post || !post.board || post.board.deletedAt) {
+    throw new NotFoundError('POST_NOT_FOUND', `Post with ID ${input.postId} not found`)
+  }
+  const board = post.board
+
+  // Enforce access-control policy: board audience + post visibility + comments-locked
+  // + merged. Workspace moderation default is the fallback for board-level `inherit`.
+  const portalConfig = await getPortalConfig()
+  const decision = canCreateComment(
+    actor,
+    {
+      moderationState: post.moderationState,
+      principalId: post.principalId,
+      authorIsTest: await isTestCustomer(post.principalId),
+      isCommentsLocked: post.isCommentsLocked,
+      isMerged: !!post.canonicalPostId,
+    },
+    { access: board.access },
+    portalConfig.moderationDefault.requireApproval
+  )
+  if (!decision.allowed) {
+    throw new ForbiddenError('FORBIDDEN', decision.reason)
+  }
+  // Author-type hold is decided here; content holds (images/links) are OR'd
+  // on after we have canonical contentJson below.
+
+  // Validate parent comment exists if specified
+  let parentIsPrivate = false
+  if (input.parentId) {
+    const parentComment = await db.query.postComments.findFirst({
+      where: eq(postComments.id, input.parentId),
+    })
+    if (!parentComment) {
+      throw new ValidationError(
+        'INVALID_PARENT',
+        `Parent comment with ID ${input.parentId} not found`
+      )
+    }
+
+    // Ensure parent comment belongs to the same post
+    if (parentComment.postId !== input.postId) {
+      throw new ValidationError('VALIDATION_ERROR', 'Parent comment belongs to a different post')
+    }
+
+    parentIsPrivate = parentComment.isPrivate
+  }
+
+  // Validate input
+  if (!input.content?.trim()) {
+    throw new ValidationError('VALIDATION_ERROR', 'Content is required')
+  }
+  if (input.content.length > 5000) {
+    throw new ValidationError('VALIDATION_ERROR', 'Content must be 5,000 characters or less')
+  }
+
+  // Determine if user is a team member
+  const authorIsTeamMember = isTeamMember(author.role)
+  const countedComment = and(
+    notTestPrincipal(posts.principalId),
+    notTestPrincipal(
+      sql`(SELECT ${principal.id} FROM ${principal} WHERE ${eq(principal.id, author.principalId)})`
+    )
+  )!
+
+  // Inherit privacy from parent: replies to private comments are always private
+  const isPrivate = parentIsPrivate || (input.isPrivate ?? false)
+
+  // Enforce team-only for private comments (after inheritance, so replying to
+  // a private parent with isPrivate omitted is also caught)
+  if (isPrivate && !authorIsTeamMember) {
+    throw new ForbiddenError(
+      'PRIVATE_COMMENT_FORBIDDEN',
+      'Only team members can post private comments'
+    )
+  }
+
+  // Determine if a status change should be applied
+  // Only for team members, root-level comments, with a valid statusId
+  const shouldChangeStatus = !!(input.statusId && authorIsTeamMember && !input.parentId)
+
+  const trimmedContent = input.content.trim()
+  const { content: storedContent, contentJson } = await prepareCommentContent({
+    content: trimmedContent,
+    contentJson: input.contentJson,
+    authorIsTeamMember,
+    principalId: author.principalId,
+  })
+  const holdReason = authorIsTeamMember
+    ? null
+    : contentHoldReason(portalConfig.moderationDefault, contentJson, storedContent)
+  const initialModerationState: ModerationState =
+    decision.requiresApproval || holdReason ? 'pending' : 'published'
+
+  let comment: PostComment
+  let previousStatusName: string | null = null
+  let newStatusName: string | null = null
+
+  if (shouldChangeStatus) {
+    // Fetch new status and current post status in parallel
+    const [newStatus, prevStatus] = await Promise.all([
+      db.query.postStatuses.findFirst({
+        where: eq(postStatuses.id, input.statusId as PostStatusId),
+      }),
+      post.statusId
+        ? db.query.postStatuses.findFirst({ where: eq(postStatuses.id, post.statusId) })
+        : null,
+    ])
+
+    if (!newStatus) {
+      throw new NotFoundError('STATUS_NOT_FOUND', `Status with ID ${input.statusId} not found`)
+    }
+
+    previousStatusName = prevStatus?.name ?? 'Open'
+    newStatusName = newStatus.name
+
+    // Atomic transaction: insert comment + update post status + conditionally increment comment count
+    const result = await db.transaction(async (tx) => {
+      const [insertedComment] = await tx
+        .insert(postComments)
+        .values({
+          postId: input.postId,
+          content: storedContent,
+          contentJson,
+          parentId: input.parentId || null,
+          principalId: author.principalId,
+          isTeamMember: authorIsTeamMember,
+          isPrivate,
+          moderationState: initialModerationState,
+          statusChangeFromId: prevStatus?.id ?? null,
+          statusChangeToId: newStatus.id,
+          ...(input.createdAt && { createdAt: input.createdAt }),
+        })
+        .returning()
+
+      const [updatedPost] = await tx
+        .update(posts)
+        .set({
+          statusId: input.statusId as PostStatusId,
+          // Private and pending comments don't count toward the public
+          // commentCount. Pending comments are held back from public reads
+          // (see post.public.detail.ts) — `approveCommentFn` re-increments
+          // the count when the comment becomes visible. Rejected (soft-
+          // deleted) pending comments stay uncounted since they never
+          // incremented in the first place.
+          ...(isPrivate || initialModerationState === 'pending'
+            ? {}
+            : {
+                commentCount: sql`CASE WHEN ${countedComment} THEN ${posts.commentCount} + 1 ELSE ${posts.commentCount} END`,
+              }),
+        })
+        .where(eq(posts.id, input.postId))
+        .returning({ countsComment: countedComment })
+
+      if (updatedPost?.countsComment && !isPrivate && initialModerationState !== 'pending') {
+        await adjustCanonicalCommentCount(input.postId, 1, tx)
+      }
+
+      return insertedComment
+    })
+
+    comment = result
+
+    // Mirror the status transition into the post_activity log, exactly as the
+    // direct status-change paths (post.status.ts, post.service.ts) do. Without
+    // this the audit timeline silently omits status changes made through a
+    // comment, and analytics has to union the comments table to find them.
+    // Fire-and-forget, like the other paths; the status was already committed.
+    createActivity({
+      postId: input.postId,
+      principalId: author.principalId,
+      type: 'status.changed',
+      metadata: {
+        fromName: previousStatusName,
+        fromColor: prevStatus?.color ?? null,
+        toName: newStatus.name,
+        // Stable identifier (names are editable) so analytics can match the
+        // target status by slug even after a rename.
+        toSlug: newStatus.slug,
+        toColor: newStatus.color ?? null,
+      },
+    })
+  } else {
+    // Atomic transaction: insert comment + conditionally increment comment count
+    const result = await db.transaction(async (tx) => {
+      const [insertedComment] = await tx
+        .insert(postComments)
+        .values({
+          postId: input.postId,
+          content: storedContent,
+          contentJson,
+          parentId: input.parentId || null,
+          principalId: author.principalId,
+          isTeamMember: authorIsTeamMember,
+          isPrivate,
+          moderationState: initialModerationState,
+          ...(input.createdAt && { createdAt: input.createdAt }),
+        })
+        .returning()
+
+      // Private and pending comments don't count toward the public
+      // commentCount. Pending comments are held back from public reads
+      // (see post.public.detail.ts) — `approveCommentFn` re-increments
+      // the count when the comment becomes visible.
+      if (!isPrivate && initialModerationState !== 'pending') {
+        const counted = await tx
+          .update(posts)
+          .set({ commentCount: sql`${posts.commentCount} + 1` })
+          .where(and(eq(posts.id, input.postId), countedComment))
+          .returning({ id: posts.id })
+        if (counted.length > 0) await adjustCanonicalCommentCount(input.postId, 1, tx)
+      }
+
+      return insertedComment
+    })
+
+    comment = result
+  }
+
+  if (initialModerationState === 'pending') {
+    // Record audit trail for held comments. Mirrors the post.moderation.held
+    // pattern in post.service.ts so moderators have a uniform timeline.
+    await recordAuditEvent({
+      event: 'comment.moderation.held',
+      actor: {
+        userId: author.userId,
+        email: author.email,
+        role: actor.role,
+        type: actor.principalType,
+      },
+      headers: options?.headers,
+      target: { type: 'comment', id: comment.id },
+      after: { moderationState: 'pending' },
+      metadata: {
+        postId: post.id,
+        boardId: board.id,
+        principalType: actor.principalType,
+        ...(holdReason ? { reason: holdReason } : {}),
+        previouslyPublished: false,
+      },
+    })
+  }
+
+  // Auto-subscribe commenter to the post even when held — so the author
+  // receives the approval/rejection notification and any subsequent thread
+  // activity once approved. Mirrors post.service.ts which subscribes
+  // authors of held posts.
+  if (!options?.skipDispatch && author.principalId) {
+    await subscribeToPost(author.principalId, input.postId, 'comment')
+  }
+
+  // External dispatch (webhooks, Slack, @-mention emails) is deferred until
+  // the comment is visible. Held comments fire dispatch only on approval
+  // via approveCommentFn — mirroring the post-moderation flow.
+  if (!options?.skipDispatch && initialModerationState === 'published') {
+    // Dispatch comment.created for webhooks, Slack, etc. Shares the payload
+    // mapping with approveCommentFn's release path via dispatchCommentCreatedEvent.
+    await dispatchCommentCreatedEvent(
+      author,
+      { id: comment.id, content: comment.content, isPrivate },
+      { id: post.id, title: post.title, boardId: board.id, boardSlug: board.slug }
+    )
+
+    // Dispatch status change event if status was changed
+    if (shouldChangeStatus && previousStatusName && newStatusName) {
+      await dispatchPostStatusChanged(
+        buildEventActor(author),
+        {
+          id: post.id,
+          title: post.title,
+          boardId: board.id,
+          boardSlug: board.slug,
+        },
+        previousStatusName,
+        newStatusName
+      )
+    }
+  }
+
+  return { comment, post: { id: post.id, title: post.title, boardSlug: board.slug } }
+}
+
+export async function updateComment(
+  id: PostCommentId,
+  input: UpdateCommentInput,
+  actor: { principalId: PrincipalId; role: Role; userId?: UserId }
+): Promise<PostComment> {
+  log.info({ comment_id: id }, 'update comment')
+  // Get existing comment with post and board in single query
+  const existingComment = await db.query.postComments.findFirst({
+    where: eq(postComments.id, id),
+    with: {
+      post: {
+        with: { board: true },
+      },
+    },
+  })
+  if (!existingComment) {
+    throw new NotFoundError('COMMENT_NOT_FOUND', `Comment with ID ${id} not found`)
+  }
+  if (!existingComment.post || !existingComment.post.board) {
+    throw new NotFoundError('POST_NOT_FOUND', `Post with ID ${existingComment.postId} not found`)
+  }
+
+  // Authorization check - user must be comment author or team member
+  const isAuthor = existingComment.principalId === actor.principalId
+
+  if (!isAuthor && !isTeamMember(actor.role)) {
+    throw new ForbiddenError('UNAUTHORIZED', 'You are not authorized to update this comment')
+  }
+
+  // Validate input
+  if (input.content !== undefined) {
+    if (!input.content.trim()) {
+      throw new ValidationError('VALIDATION_ERROR', 'Content cannot be empty')
+    }
+    if (input.content.length > 5000) {
+      throw new ValidationError('VALIDATION_ERROR', 'Content must be 5,000 characters or less')
+    }
+  }
+
+  // Build update data. contentJson-only updates still go through sanitize +
+  // rehost so a caller cannot persist hostile image srcs (the sanitizer is
+  // the only gate; the zod schema is z.unknown()).
+  const updateData: Partial<PostComment> = {}
+  if (input.content !== undefined || input.contentJson !== undefined) {
+    const trimmed = (input.content ?? existingComment.content).trim()
+    const prepared = await prepareCommentContent({
+      content: trimmed,
+      contentJson: input.contentJson ?? undefined,
+      authorIsTeamMember: isTeamMember(actor.role),
+      principalId: actor.principalId,
+    })
+    updateData.content = prepared.content
+    updateData.contentJson = prepared.contentJson
+  }
+
+  // Update the comment
+  const [updatedComment] = await db
+    .update(postComments)
+    .set(updateData)
+    .where(eq(postComments.id, id))
+    .returning()
+
+  if (!updatedComment) {
+    throw new NotFoundError('COMMENT_NOT_FOUND', `Comment with ID ${id} not found`)
+  }
+
+  // Dispatch comment.updated event for webhooks and integrations
+  const post = existingComment.post
+  const board = post.board
+  dispatchCommentUpdated(
+    buildEventActor({ principalId: actor.principalId, userId: actor.userId }),
+    {
+      id: updatedComment.id,
+      content: updatedComment.content,
+      isPrivate: updatedComment.isPrivate ?? undefined,
+    },
+    {
+      id: post.id,
+      title: post.title,
+      boardId: board.id,
+      boardSlug: board.slug,
+    }
+  )
+
+  return updatedComment
+}
+
+/**
+ * Delete a comment
+ *
+ * Validates that:
+ * - Comment exists and belongs to the organization
+ * - User has permission to delete the comment (must be the author or team member)
+ *
+ * Note: Deleting a comment will cascade delete all replies due to database constraints
+ *
+ * @param id - Comment ID to delete
+ * @param actor - Actor information with principalId and role
+ * @returns Result indicating success or an error
+ */
+export async function deleteComment(
+  id: PostCommentId,
+  actor: { principalId: PrincipalId; role: Role; userId?: UserId }
+): Promise<void> {
+  log.info({ comment_id: id }, 'delete comment')
+  // Get existing comment with post and board in single query
+  const existingComment = await db.query.postComments.findFirst({
+    where: eq(postComments.id, id),
+    with: {
+      post: {
+        with: { board: true },
+      },
+    },
+  })
+  if (!existingComment) {
+    throw new NotFoundError('COMMENT_NOT_FOUND', `Comment with ID ${id} not found`)
+  }
+  if (!existingComment.post || !existingComment.post.board) {
+    throw new NotFoundError('POST_NOT_FOUND', `Post with ID ${existingComment.postId} not found`)
+  }
+
+  // Authorization check - user must be comment author or team member
+  const isAuthor = existingComment.principalId === actor.principalId
+
+  if (!isAuthor && !isTeamMember(actor.role)) {
+    throw new ForbiddenError('UNAUTHORIZED', 'You are not authorized to delete this comment')
+  }
+
+  // Atomic transaction: delete comment + conditionally decrement comment count
+  await db.transaction(async (tx) => {
+    const countedRows = await tx.execute(sql`
+      WITH RECURSIVE subtree AS (
+        SELECT id, principal_id, is_private, moderation_state, deleted_at
+        FROM ${postComments} WHERE ${eq(postComments.id, id)}
+        UNION ALL
+        SELECT child.id, child.principal_id, child.is_private, child.moderation_state, child.deleted_at
+        FROM ${postComments} child
+        JOIN subtree parent ON child.parent_id = parent.id
+      )
+      SELECT count(*)::int AS count FROM subtree
+      WHERE deleted_at IS NULL AND is_private = false AND moderation_state <> 'pending'
+        AND ${notTestPrincipal(sql`principal_id`)}
+    `)
+    const [counted] = Array.from(countedRows as Iterable<{ count: number }>)
+    const result = await tx.delete(postComments).where(eq(postComments.id, id)).returning()
+    if (result.length === 0) {
+      throw new NotFoundError('COMMENT_NOT_FOUND', `Comment with ID ${id} not found`)
+    }
+
+    // Decide the decrement from the deleted row's own state (DELETE locks the
+    // row), not the pre-transaction snapshot: a concurrent approval could have
+    // published + counted a previously-pending comment between the read and
+    // here. Skip when already soft-deleted (the soft-delete already decremented)
+    // or when the comment was never counted (private / still-pending).
+    const decrement = Number(counted?.count ?? 0)
+    if (decrement > 0) {
+      const counted = await tx
+        .update(posts)
+        .set({ commentCount: sql`GREATEST(0, ${posts.commentCount} - ${decrement})` })
+        .where(and(eq(posts.id, existingComment.postId), notTestPrincipal(posts.principalId)))
+        .returning({ id: posts.id })
+      if (counted.length > 0)
+        await adjustCanonicalCommentCount(existingComment.postId, -decrement, tx)
+    }
+  })
+
+  // Dispatch comment.deleted event for webhooks and integrations
+  const post = existingComment.post
+  const board = post.board
+  dispatchCommentDeleted(
+    buildEventActor({ principalId: actor.principalId, userId: actor.userId }),
+    {
+      id,
+      isPrivate: existingComment.isPrivate ?? undefined,
+    },
+    {
+      id: post.id,
+      title: post.title,
+      boardId: board.id,
+      boardSlug: board.slug,
+    }
+  )
+}

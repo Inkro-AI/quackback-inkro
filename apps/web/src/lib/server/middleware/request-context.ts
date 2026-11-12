@@ -1,0 +1,159 @@
+/**
+ * Global request middleware — opens the per-request log context and emits
+ * access logs.
+ *
+ * Runs first for every server request (SSR document, server routes, server
+ * functions). It:
+ *   - derives a stable request_id (inbound x-request-id / x-correlation-id,
+ *     else a fresh UUID) and echoes it back on the response for correlation,
+ *   - opens the AsyncLocalStorage log context so every `logger.*` call within
+ *     the request automatically carries request_id + route,
+ *   - logs request completion with status, duration and query count, or
+ *     failure on throw (a client disconnect at info, anything else at error);
+ *     with QUACKBACK_SERVER_TIMING=1 the same numbers go out as a
+ *     Server-Timing header for the browser's network panel.
+ *
+ * Downstream code enriches the context with workspace_key / user_id via
+ * setLogContext() once auth resolves.
+ */
+import type { AppLogger } from '@quackback/logger'
+import { createMiddleware } from '@tanstack/react-start'
+import { logger } from '@/lib/server/logger'
+import { runWithLogContext } from '@/lib/server/log-context'
+import { formatServerTiming, openRequestMetrics } from '@/lib/server/request-metrics'
+import { onResponseBodyEnd } from '@/lib/server/response-hooks'
+import {
+  isClientDisconnect,
+  noteClientDisconnectOf,
+  noteLoggedAtBoundary,
+} from '@/lib/server/runtime-error-log'
+
+/**
+ * Health probe path. Hit every few seconds by the platform's healthcheck,
+ * so a successful probe is pure access-log noise. We skip the completion
+ * line for healthy probes only — an unhealthy probe (status >= 400)
+ * or a thrown error is still logged, since those are the signal we care about.
+ */
+function isHealthPath(pathname: string): boolean {
+  return pathname === '/api/health' || pathname.startsWith('/api/health/')
+}
+
+function deriveRequestId(request: Request): string {
+  const header = request.headers.get('x-request-id') ?? request.headers.get('x-correlation-id')
+  // Cap to keep a malicious/huge header out of every log line.
+  if (header) return header.slice(0, 200)
+  return crypto.randomUUID()
+}
+
+/**
+ * Minimal shape of what the framework's `next()` resolves to.
+ *
+ * `response` is optional on purpose. `next()` returns the request context, and
+ * the framework only attaches a response once something downstream produced
+ * one — which a failing server function has not yet done at this point.
+ */
+interface NextResult {
+  response?: Response
+}
+
+/**
+ * Core request handling, decoupled from the framework so it can be unit tested.
+ * `log` is injectable as a test seam; production passes the shared logger.
+ */
+export async function handleRequestWithContext<T extends NextResult>({
+  request,
+  next,
+  log = logger,
+  serverTiming = process.env.QUACKBACK_SERVER_TIMING === '1',
+}: {
+  request: Request
+  next: () => Promise<T>
+  log?: AppLogger
+  serverTiming?: boolean
+}): Promise<T> {
+  const requestId = deriveRequestId(request)
+  const pathname = new URL(request.url).pathname
+  const route = `${request.method} ${pathname}`
+  const start = performance.now()
+
+  // The framework may rethrow a disconnect after this boundary has returned;
+  // mark it so the runtime's own print of it is dropped (runtime-error-log.ts).
+  noteClientDisconnectOf(request)
+
+  return runWithLogContext({ request_id: requestId, route }, async () => {
+    const metrics = openRequestMetrics()!
+    try {
+      const result = await next()
+      const durationMs = Math.round(performance.now() - start)
+      // `next()` resolves to the framework's context, and `response` is only
+      // present once something downstream produced one. A failing server
+      // function does not: the error is carried as a value and turned into a
+      // response after this middleware returns. Dereferencing it
+      // unconditionally threw a TypeError out of this boundary, which the
+      // framework then reported to the client as an unhandled 500 in place of
+      // the serialized error it had already built.
+      const response = result.response
+      // Echo the id back so clients/proxies can correlate.
+      try {
+        response?.headers.set('x-request-id', requestId)
+        if (serverTiming) {
+          response?.headers.set('server-timing', formatServerTiming(metrics, durationMs))
+        }
+      } catch {
+        // Some responses have immutable headers; correlation still works
+        // via the logged request_id.
+      }
+      const status = response?.status
+      // Suppress the completion line for successful health probes. Everything
+      // else — and unhealthy probes — still logs.
+      const quiet = isHealthPath(pathname) && status !== undefined && status < 400
+      if (!quiet) {
+        log.info(
+          { status, duration_ms: durationMs, db_queries: metrics.dbQueries },
+          'request completed'
+        )
+      }
+      // A document streams: queries can still run after the headers left, so
+      // the count above can be short. With Server-Timing on, log the final
+      // count once the body has been fully written (one line per request).
+      if (serverTiming && !quiet) {
+        const finish = () =>
+          log.info(
+            {
+              request_id: requestId,
+              route,
+              status,
+              duration_ms: Math.round(performance.now() - start),
+              db_queries: metrics.dbQueries,
+            },
+            'request finished'
+          )
+        // Never swap the response here: the server entry runs the hook
+        // (see response-hooks.ts for why).
+        if (response?.body) onResponseBodyEnd(response, finish)
+        else finish()
+      }
+      return result
+    } catch (err) {
+      const durationMs = Math.round(performance.now() - start)
+      const fields = { err, duration_ms: durationMs, db_queries: metrics.dbQueries }
+      // A client that closes the connection mid-request surfaces as the
+      // request signal's AbortError. Nothing failed on our side, so it is an
+      // access-log line rather than an error. Any other AbortError (our own
+      // cancelled work) is a failure like any other.
+      if (isClientDisconnect(err, request)) log.info(fields, 'request aborted by client')
+      else log.error(fields, 'request failed')
+      // Log once here at the boundary, then rethrow unchanged so the
+      // framework's error handling still runs. The runtime's own print of the
+      // same error is suppressed (see runtime-error-log.ts).
+      noteLoggedAtBoundary(err)
+      throw err
+    }
+  })
+}
+
+export const requestContextMiddleware = createMiddleware().server(({ next, request }) =>
+  // Wrap next() so its (awaitable) result is a real Promise; T then infers
+  // from the framework's own result type, keeping the return type aligned.
+  handleRequestWithContext({ request, next: () => Promise.resolve(next()) })
+)

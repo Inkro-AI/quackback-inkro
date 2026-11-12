@@ -1,0 +1,234 @@
+import { describe, it, expectTypeOf } from 'vitest'
+import type {
+  Board,
+  NewBoard,
+  Roadmap,
+  NewRoadmap,
+  PostTag,
+  NewPostTag,
+  Post,
+  NewPost,
+  PostTagAssignment,
+  NewPostTagAssignment,
+  PostVote,
+  NewPostVote,
+  Comment,
+  NewPostComment,
+  PostCommentReaction,
+  NewPostCommentReaction,
+  Integration,
+  NewIntegration,
+  IntegrationStatus,
+  ChangelogEntry,
+  NewChangelogEntry,
+  PostWithTags,
+  CommentWithReplies,
+  PostWithDetails,
+} from '../types'
+
+describe('Type definitions', () => {
+  describe('Board types', () => {
+    it('Board has correct shape', () => {
+      expectTypeOf<Board>().toHaveProperty('id')
+      expectTypeOf<Board>().toHaveProperty('slug')
+      expectTypeOf<Board>().toHaveProperty('name')
+      expectTypeOf<Board>().toHaveProperty('description')
+      expectTypeOf<Board>().toHaveProperty('isPublic')
+      expectTypeOf<Board>().toHaveProperty('settings')
+      expectTypeOf<Board>().toHaveProperty('createdAt')
+      expectTypeOf<Board>().toHaveProperty('updatedAt')
+    })
+
+    it('NewBoard has required fields', () => {
+      expectTypeOf<NewBoard>().toHaveProperty('slug')
+      expectTypeOf<NewBoard>().toHaveProperty('name')
+    })
+
+    it('Board.id is a string', () => {
+      expectTypeOf<Board['id']>().toBeString()
+    })
+
+    it('Board.isPublic is a boolean', () => {
+      expectTypeOf<Board['isPublic']>().toBeBoolean()
+    })
+
+    it('Board.createdAt is a Date', () => {
+      expectTypeOf<Board['createdAt']>().toEqualTypeOf<Date>()
+    })
+  })
+
+  describe('Roadmap types', () => {
+    it('Roadmap has correct shape', () => {
+      expectTypeOf<Roadmap>().toHaveProperty('id')
+      expectTypeOf<Roadmap>().toHaveProperty('slug')
+      expectTypeOf<Roadmap>().toHaveProperty('name')
+      expectTypeOf<Roadmap>().toHaveProperty('visibility')
+      expectTypeOf<Roadmap>().toHaveProperty('position')
+    })
+
+    it('NewRoadmap has required fields', () => {
+      expectTypeOf<NewRoadmap>().toHaveProperty('slug')
+      expectTypeOf<NewRoadmap>().toHaveProperty('name')
+    })
+  })
+
+  describe('PostTag types', () => {
+    it('PostTag has correct shape', () => {
+      expectTypeOf<PostTag>().toHaveProperty('id')
+      expectTypeOf<PostTag>().toHaveProperty('name')
+      expectTypeOf<PostTag>().toHaveProperty('color')
+    })
+
+    it('NewPostTag has required fields', () => {
+      expectTypeOf<NewPostTag>().toHaveProperty('name')
+    })
+  })
+
+  describe('Post types', () => {
+    it('Post has correct shape', () => {
+      expectTypeOf<Post>().toHaveProperty('id')
+      expectTypeOf<Post>().toHaveProperty('boardId')
+      expectTypeOf<Post>().toHaveProperty('title')
+      expectTypeOf<Post>().toHaveProperty('content')
+      expectTypeOf<Post>().toHaveProperty('principalId')
+      expectTypeOf<Post>().toHaveProperty('statusId')
+      expectTypeOf<Post>().toHaveProperty('voteCount')
+    })
+
+    it('NewPost has required fields', () => {
+      expectTypeOf<NewPost>().toHaveProperty('boardId')
+      expectTypeOf<NewPost>().toHaveProperty('title')
+      expectTypeOf<NewPost>().toHaveProperty('content')
+    })
+
+    it('Post.voteCount is a number', () => {
+      expectTypeOf<Post['voteCount']>().toBeNumber()
+    })
+  })
+
+  describe('Junction table types', () => {
+    it('PostTagAssignment has correct shape', () => {
+      expectTypeOf<PostTagAssignment>().toHaveProperty('postId')
+      expectTypeOf<PostTagAssignment>().toHaveProperty('tagId')
+    })
+
+    it('NewPostTagAssignment has required fields', () => {
+      expectTypeOf<NewPostTagAssignment>().toHaveProperty('postId')
+      expectTypeOf<NewPostTagAssignment>().toHaveProperty('tagId')
+    })
+  })
+
+  describe('PostVote types', () => {
+    it('PostVote has correct shape', () => {
+      expectTypeOf<PostVote>().toHaveProperty('id')
+      expectTypeOf<PostVote>().toHaveProperty('postId')
+      expectTypeOf<PostVote>().toHaveProperty('principalId')
+      expectTypeOf<PostVote>().toHaveProperty('createdAt')
+    })
+
+    it('NewPostVote has required fields', () => {
+      expectTypeOf<NewPostVote>().toHaveProperty('postId')
+      expectTypeOf<NewPostVote>().toHaveProperty('principalId')
+    })
+  })
+
+  describe('Comment types', () => {
+    it('Comment has correct shape', () => {
+      expectTypeOf<PostComment>().toHaveProperty('id')
+      expectTypeOf<PostComment>().toHaveProperty('postId')
+      expectTypeOf<PostComment>().toHaveProperty('parentId')
+      expectTypeOf<PostComment>().toHaveProperty('content')
+      expectTypeOf<PostComment>().toHaveProperty('createdAt')
+    })
+
+    it('NewPostComment has required fields', () => {
+      expectTypeOf<NewPostComment>().toHaveProperty('postId')
+      expectTypeOf<NewPostComment>().toHaveProperty('content')
+    })
+
+    it('Comment.parentId can be null', () => {
+      // parentId is now PostCommentId | null (TypeId branded string)
+      expectTypeOf<Comment['parentId']>().toMatchTypeOf<`comment_${string}` | null>()
+    })
+  })
+
+  describe('PostCommentReaction types', () => {
+    it('PostCommentReaction has correct shape', () => {
+      expectTypeOf<PostCommentReaction>().toHaveProperty('id')
+      expectTypeOf<PostCommentReaction>().toHaveProperty('commentId')
+      expectTypeOf<PostCommentReaction>().toHaveProperty('principalId')
+      expectTypeOf<PostCommentReaction>().toHaveProperty('emoji')
+    })
+
+    it('NewPostCommentReaction has required fields', () => {
+      expectTypeOf<NewPostCommentReaction>().toHaveProperty('commentId')
+      expectTypeOf<NewPostCommentReaction>().toHaveProperty('principalId')
+      expectTypeOf<NewPostCommentReaction>().toHaveProperty('emoji')
+    })
+  })
+
+  describe('Integration types', () => {
+    it('Integration has correct shape', () => {
+      expectTypeOf<Integration>().toHaveProperty('id')
+      expectTypeOf<Integration>().toHaveProperty('integrationType')
+      expectTypeOf<Integration>().toHaveProperty('status')
+      expectTypeOf<Integration>().toHaveProperty('config')
+    })
+
+    it('NewIntegration has required fields', () => {
+      expectTypeOf<NewIntegration>().toHaveProperty('integrationType')
+    })
+
+    it('IntegrationStatus is a string', () => {
+      expectTypeOf<IntegrationStatus>().toBeString()
+    })
+  })
+
+  describe('ChangelogEntry types', () => {
+    it('ChangelogEntry has correct shape', () => {
+      expectTypeOf<ChangelogEntry>().toHaveProperty('id')
+      expectTypeOf<ChangelogEntry>().toHaveProperty('boardId')
+      expectTypeOf<ChangelogEntry>().toHaveProperty('title')
+      expectTypeOf<ChangelogEntry>().toHaveProperty('content')
+      expectTypeOf<ChangelogEntry>().toHaveProperty('publishedAt')
+    })
+
+    it('NewChangelogEntry has required fields', () => {
+      expectTypeOf<NewChangelogEntry>().toHaveProperty('boardId')
+      expectTypeOf<NewChangelogEntry>().toHaveProperty('title')
+      expectTypeOf<NewChangelogEntry>().toHaveProperty('content')
+    })
+
+    it('ChangelogEntry.publishedAt can be null', () => {
+      expectTypeOf<ChangelogEntry['publishedAt']>().toEqualTypeOf<Date | null>()
+    })
+  })
+
+  describe('Composite types', () => {
+    it('PostWithTags extends Post with tags array', () => {
+      expectTypeOf<PostWithTags>().toHaveProperty('id')
+      expectTypeOf<PostWithTags>().toHaveProperty('title')
+      expectTypeOf<PostWithTags>().toHaveProperty('tags')
+      expectTypeOf<PostWithTags['tags']>().toEqualTypeOf<PostTag[]>()
+    })
+
+    it('CommentWithReplies has recursive replies', () => {
+      expectTypeOf<CommentWithReplies>().toHaveProperty('id')
+      expectTypeOf<CommentWithReplies>().toHaveProperty('content')
+      expectTypeOf<CommentWithReplies>().toHaveProperty('replies')
+      expectTypeOf<CommentWithReplies>().toHaveProperty('reactions')
+    })
+
+    it('PostWithDetails has all relations', () => {
+      expectTypeOf<PostWithDetails>().toHaveProperty('id')
+      expectTypeOf<PostWithDetails>().toHaveProperty('board')
+      expectTypeOf<PostWithDetails>().toHaveProperty('tags')
+      expectTypeOf<PostWithDetails>().toHaveProperty('comments')
+      expectTypeOf<PostWithDetails>().toHaveProperty('votes')
+    })
+
+    it('PostWithDetails.board is a Board', () => {
+      expectTypeOf<PostWithDetails['board']>().toEqualTypeOf<Board>()
+    })
+  })
+})

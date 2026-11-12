@@ -1,0 +1,1032 @@
+import { lazy, Suspense, useEffect, useState, type ReactNode } from 'react'
+import { useQuery, useInfiniteQuery } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
+import {
+  ArrowLeftIcon,
+  ArrowTopRightOnSquareIcon,
+  CheckCircleIcon,
+  ChatBubbleLeftIcon,
+  HandThumbUpIcon,
+  ArrowPathIcon,
+  TrashIcon,
+  ChevronUpIcon,
+  ChevronDownIcon,
+  PencilSquareIcon,
+  Squares2X2Icon,
+  PencilIcon,
+  XMarkIcon,
+  CheckIcon,
+  EllipsisHorizontalIcon,
+  NoSymbolIcon,
+  ArrowsRightLeftIcon,
+  UserPlusIcon,
+  ShieldCheckIcon,
+} from '@heroicons/react/24/solid'
+import { toast } from 'sonner'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Avatar } from '@/components/ui/avatar'
+import { LocalDate } from '@/components/ui/local-date'
+import { Badge } from '@/components/ui/badge'
+import { Skeleton } from '@/components/ui/skeleton'
+import { StatusBadge } from '@/components/ui/status-badge'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { contentPreview } from '@/lib/shared/utils/string'
+import { cn } from '@/lib/shared/utils'
+import { countryName } from '@/lib/shared/country'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { ChannelBadge } from '@/components/admin/conversation/channel-badge'
+import { getChannelDescriptor } from '@/lib/shared/channels'
+import { NewConversationDialog } from '@/components/admin/conversation/new-conversation-dialog'
+import { ConfirmDialog } from '@/components/shared/confirm-dialog'
+import { TimeAgo } from '@/components/ui/time-ago'
+import type { PortalUserDetail, EngagedPost } from '@/lib/shared/types'
+import type { ConversationDTO, ConversationStatus } from '@/lib/shared/conversation/types'
+import type { FeatureFlags } from '@/lib/shared/types/settings'
+import { UserSegmentBadges } from '@/components/admin/users/user-segments'
+import { UserTagControl } from '@/components/admin/users/user-tag-control'
+import { UserCompanyControl } from '@/components/admin/users/user-company-control'
+import {
+  BlockPersonControl,
+  usePersonBlockActions,
+} from '@/components/admin/users/block-person-control'
+import { ChangelogSubscriptionControl } from '@/components/admin/users/changelog-subscription-control'
+import { DuplicateUsersWarning } from '@/components/admin/users/duplicate-users-warning'
+import { MergeLeadControl } from '@/components/admin/users/merge-lead-control'
+import type { RoleChoice } from '@/components/admin/settings/team/add-people'
+import { useUpdatePortalUser } from '@/lib/client/mutations'
+import { listConversationsForUserFn, getConversationFn } from '@/lib/server/functions/conversation'
+import type { PrincipalId } from '@quackback/ids'
+import { useSessionContext, useWorkspaceSettings } from '@/lib/client/hooks/use-root-context'
+import { useOpenedOnce } from '@/lib/client/hooks/use-opened-once'
+
+// Team dialogs load the first time one opens, not with the profile.
+const AddPeopleDialog = lazy(() =>
+  import('@/components/admin/settings/team/add-people-dialog').then((m) => ({
+    default: m.AddPeopleDialog,
+  }))
+)
+const ChangeRoleDialog = lazy(() =>
+  import('@/components/admin/settings/team/change-role-dialog').then((m) => ({
+    default: m.ChangeRoleDialog,
+  }))
+)
+
+/** A teammate's role from the detail, as the role select and badge read it. */
+function teamRoleChoice(teamRole: PortalUserDetail['teamRole']): RoleChoice | null {
+  if (!teamRole) return null
+  return {
+    role: teamRole.role,
+    ...(teamRole.roleId ? { roleId: teamRole.roleId } : {}),
+    label: teamRole.roleName ?? (teamRole.role === 'admin' ? 'Admin' : 'Member'),
+  }
+}
+
+const EXTERNAL_ID_KEY = '_externalUserId'
+const NO_VALUE = '-'
+
+function parseUserMetadata(metadata: string | null): {
+  attributes: [string, unknown][]
+  externalId: string | null
+} {
+  if (!metadata) return { attributes: [], externalId: null }
+  try {
+    const parsed = JSON.parse(metadata) as Record<string, unknown>
+    const externalId = typeof parsed[EXTERNAL_ID_KEY] === 'string' ? parsed[EXTERNAL_ID_KEY] : null
+    const attributes = Object.entries(parsed).filter(([key]) => !key.startsWith('_'))
+    return { attributes, externalId }
+  } catch {
+    return { attributes: [], externalId: null }
+  }
+}
+
+interface UserDetailProps {
+  user: PortalUserDetail | null
+  isLoading: boolean
+  onClose: () => void
+  onRemoveUser: () => void
+  isRemovePending: boolean
+  currentMemberRole: string
+}
+
+const PROFILE_DATE: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric', year: 'numeric' }
+
+/** A profile date, e.g. "Oct 1, 2026", in the viewer's zone once hydrated. */
+function ProfileDate({ date }: { date: Date | string }) {
+  return <LocalDate date={date} options={PROFILE_DATE} locale="en-US" />
+}
+
+function DetailSkeleton() {
+  return (
+    <div className="px-6 pb-6 space-y-5">
+      <div className="flex items-start gap-4">
+        <Skeleton className="h-16 w-16 rounded-full" />
+        <div className="flex-1">
+          <Skeleton className="mb-2 h-6 w-40" />
+          <Skeleton className="h-4 w-48" />
+        </div>
+      </div>
+      <Skeleton className="h-[52px] w-full rounded-lg" />
+      <div className="flex flex-col gap-6 lg:flex-row">
+        <div className="min-w-0 flex-1 space-y-3">
+          <Skeleton className="h-9 w-56 rounded-lg" />
+          {Array.from({ length: 3 }).map((_, i) => (
+            <Skeleton key={i} className="h-16 w-full" />
+          ))}
+        </div>
+        <div className="w-full space-y-3 lg:w-[300px] lg:shrink-0">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <Skeleton key={i} className="h-24 w-full rounded-lg" />
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function RailCard({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="rounded-lg border border-border/50 p-3.5">
+      <h3 className="mb-2 text-[13px] font-medium leading-[18px]">{title}</h3>
+      {children}
+    </div>
+  )
+}
+
+function KvRow({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-2 py-[3px] text-xs leading-4">
+      <span className="text-muted-foreground">{label}</span>
+      <span className="min-w-0 truncate text-right">{children}</span>
+    </div>
+  )
+}
+
+function EmptyMessage({ message }: { message: string }) {
+  return (
+    <div className="flex flex-col items-center justify-center py-8 px-4 text-center">
+      <p className="text-sm text-muted-foreground">{message}</p>
+    </div>
+  )
+}
+
+function EngagementBadges({ types }: { types: EngagedPost['engagementTypes'] }) {
+  return (
+    <div className="flex items-center gap-1">
+      {types.includes('authored') && (
+        <span
+          className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[11px] font-medium bg-primary/10 text-primary"
+          title="Authored this post"
+        >
+          <PencilSquareIcon className="h-2.5 w-2.5" />
+        </span>
+      )}
+      {types.includes('commented') && (
+        <span
+          className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[11px] font-medium bg-blue-500/10 text-blue-600 dark:text-blue-400"
+          title="Commented on this post"
+        >
+          <ChatBubbleLeftIcon className="h-2.5 w-2.5" />
+        </span>
+      )}
+      {types.includes('voted') && (
+        <span
+          className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[11px] font-medium bg-orange-500/10 text-orange-600 dark:text-orange-400"
+          title="Voted on this post"
+        >
+          <HandThumbUpIcon className="h-2.5 w-2.5" />
+        </span>
+      )}
+    </div>
+  )
+}
+
+function EngagedPostCard({ post }: { post: EngagedPost }) {
+  return (
+    <Link
+      to="/b/$slug/posts/$postId"
+      params={{ slug: post.boardSlug, postId: post.id }}
+      className="flex transition-colors hover:bg-muted/30 border-b border-border/30 last:border-b-0"
+    >
+      {/* Vote section - left column */}
+      <div className="flex flex-col items-center justify-center w-14 shrink-0 border-r border-border/30 py-3">
+        <ChevronUpIcon className="h-5 w-5 text-muted-foreground" />
+        <span className="text-xs font-bold text-foreground">{post.voteCount}</span>
+      </div>
+
+      {/* Content section */}
+      <div className="flex-1 min-w-0 px-3 py-2.5">
+        {/* Status and engagement badges row */}
+        <div className="flex items-center gap-2 mb-1.5">
+          {post.statusName && <StatusBadge name={post.statusName} color={post.statusColor} />}
+          <EngagementBadges types={post.engagementTypes} />
+        </div>
+
+        {/* Title */}
+        <h4 className="font-medium text-sm text-foreground line-clamp-1 mb-0.5">{post.title}</h4>
+
+        {/* Description */}
+        <p className="text-xs text-muted-foreground/80 line-clamp-2 mb-2">
+          {contentPreview(post.content)}
+        </p>
+
+        {/* Footer */}
+        <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+          <span className="text-foreground/70">{post.authorName || 'Anonymous'}</span>
+          <span className="text-muted-foreground/50">·</span>
+          <TimeAgo date={new Date(post.createdAt)} />
+          <div className="flex-1" />
+          <div className="flex items-center gap-1 text-muted-foreground/70">
+            <ChatBubbleLeftIcon className="h-3 w-3" />
+            <span>{post.commentCount}</span>
+          </div>
+          <Badge
+            variant="secondary"
+            className="text-[11px] bg-muted/50 px-1.5 py-0 inline-flex items-center gap-0.5"
+          >
+            <Squares2X2Icon className="h-2.5 w-2.5 text-muted-foreground/40" />
+            {post.boardName}
+          </Badge>
+        </div>
+      </div>
+    </Link>
+  )
+}
+
+type StatusFilter = ConversationStatus | 'all'
+
+const STATUS_STYLE: Record<ConversationStatus, string> = {
+  open: 'bg-emerald-500/10 text-emerald-600',
+  snoozed: 'bg-amber-500/10 text-amber-600',
+  closed: 'bg-muted text-muted-foreground',
+}
+
+/** Read-only preview of a conversation's most recent visitor/agent messages. */
+function ConversationPreview({ conversationId }: { conversationId: ConversationDTO['id'] }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ['admin', 'conversation-preview', conversationId],
+    queryFn: () => getConversationFn({ data: { conversationId } }),
+  })
+  if (isLoading) {
+    return <Skeleton className="mt-2 h-16 w-full rounded-md" />
+  }
+  const messages = (data?.messages ?? []).filter((m) => !m.isInternal).slice(-4)
+  return (
+    <div className="mt-2 space-y-2 rounded-md border border-border/50 bg-muted/20 p-2.5">
+      {messages.length === 0 ? (
+        <p className="text-xs text-muted-foreground">No messages yet</p>
+      ) : (
+        messages.map((m) => (
+          <div key={m.id} className="text-xs">
+            <span className="font-medium text-foreground">
+              {m.senderType === 'visitor' ? 'Visitor' : (m.author?.displayName ?? 'Agent')}
+            </span>{' '}
+            <span className="text-muted-foreground/60">
+              <TimeAgo date={m.createdAt} />
+            </span>
+            <p className="mt-0.5 whitespace-pre-wrap text-muted-foreground">{m.content}</p>
+          </div>
+        ))
+      )}
+    </div>
+  )
+}
+
+/** A user's support conversation history: filterable, paginated, with inline preview. */
+function UserConversations({
+  principalId,
+  embedded = false,
+}: {
+  principalId: PrincipalId
+  embedded?: boolean
+}) {
+  const settings = useWorkspaceSettings()
+  // Gated by the experimental supportInbox flag — when off, skip the fetch and
+  // render nothing, so the profile shows no support history for a disabled feature.
+  const supportInboxEnabled =
+    (settings?.featureFlags as FeatureFlags | undefined)?.supportInbox ?? false
+  const [status, setStatus] = useState<StatusFilter>('all')
+  const [expandedId, setExpandedId] = useState<ConversationDTO['id'] | null>(null)
+
+  const query = useInfiniteQuery({
+    queryKey: ['admin', 'user-conversations', principalId, status],
+    enabled: supportInboxEnabled,
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ pageParam }) =>
+      listConversationsForUserFn({
+        data: {
+          principalId,
+          status: status === 'all' ? undefined : status,
+          before: pageParam,
+        },
+      }),
+    getNextPageParam: (last) => (last.hasMore ? (last.nextCursor ?? undefined) : undefined),
+  })
+
+  if (!supportInboxEnabled) return null
+
+  const conversations: ConversationDTO[] = query.data?.pages.flatMap((p) => p.conversations) ?? []
+
+  return (
+    <div className={cn(!embedded && 'border-t border-border/50 pt-4')}>
+      <div className="mb-3 flex items-center justify-between">
+        {embedded ? <span /> : <h3 className="text-sm font-medium">Support conversations</h3>}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              className={cn(
+                'inline-flex items-center gap-1 rounded-md px-2 py-1 text-[13px] font-medium transition-colors',
+                status !== 'all'
+                  ? 'bg-primary/10 text-primary'
+                  : 'text-muted-foreground hover:bg-muted'
+              )}
+            >
+              <span className="capitalize">{status === 'all' ? 'Status' : status}</span>
+              <ChevronDownIcon className="size-3.5" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem
+              onClick={() => {
+                setStatus('all')
+                setExpandedId(null)
+              }}
+            >
+              All statuses
+            </DropdownMenuItem>
+            {(['open', 'snoozed', 'closed'] as const).map((s) => (
+              <DropdownMenuItem
+                key={s}
+                onClick={() => {
+                  setStatus(s)
+                  setExpandedId(null)
+                }}
+                className="capitalize"
+              >
+                {s}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+
+      {query.isPending ? (
+        <Skeleton className="h-16 w-full rounded-lg" />
+      ) : conversations.length === 0 ? (
+        <EmptyMessage
+          message={status === 'all' ? 'No conversations yet' : `No ${status} conversations`}
+        />
+      ) : (
+        <div className="divide-y divide-border/50 overflow-hidden rounded-lg border border-border/50">
+          {conversations.map((c) => {
+            const expanded = expandedId === c.id
+            return (
+              <div key={c.id}>
+                <button
+                  type="button"
+                  aria-expanded={expanded}
+                  onClick={() => setExpandedId(expanded ? null : c.id)}
+                  className="flex w-full items-start gap-2 px-3 py-2.5 text-left transition-colors hover:bg-muted/40"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="truncate text-sm text-foreground">
+                        {c.subject ?? c.lastMessagePreview ?? 'Conversation'}
+                      </span>
+                      <span
+                        className={cn(
+                          'shrink-0 rounded-full px-1.5 py-0.5 text-[11px] font-medium capitalize',
+                          STATUS_STYLE[c.status]
+                        )}
+                      >
+                        {c.status}
+                      </span>
+                    </div>
+                    <p className="mt-0.5 truncate text-xs text-muted-foreground">
+                      {c.lastMessagePreview ?? 'No messages yet'}
+                    </p>
+                    <div className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                      {c.assignedAgent ? (
+                        <span className="flex items-center gap-1">
+                          <Avatar
+                            src={c.assignedAgent.avatarUrl}
+                            name={c.assignedAgent.displayName ?? 'Agent'}
+                            className="size-4 text-xs"
+                          />
+                          {c.assignedAgent.displayName ?? 'Agent'}
+                        </span>
+                      ) : (
+                        <span>Unassigned</span>
+                      )}
+                      {getChannelDescriptor(c.channel)?.surface === 'ours' ? (
+                        <span>· {getChannelDescriptor(c.channel)?.label ?? 'Messenger'}</span>
+                      ) : (
+                        <ChannelBadge channel={c.channel} />
+                      )}
+                      {c.csatRating != null && <span>· ★ {c.csatRating}/5</span>}
+                    </div>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    <TimeAgo date={c.lastMessageAt} className="text-[11px] text-muted-foreground" />
+                    {c.unreadCount > 0 && <Badge className="shrink-0">{c.unreadCount}</Badge>}
+                    <ChevronDownIcon
+                      className={cn(
+                        'h-4 w-4 text-muted-foreground/50 transition-transform',
+                        expanded && 'rotate-180'
+                      )}
+                    />
+                  </div>
+                </button>
+                {expanded && (
+                  <div className="px-3 pb-3">
+                    <ConversationPreview conversationId={c.id} />
+                    <div className="mt-2 text-right">
+                      <Link
+                        to="/admin/inbox"
+                        search={{ c: c.id }}
+                        className="text-xs font-medium text-primary hover:underline"
+                      >
+                        Open in inbox →
+                      </Link>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {query.hasNextPage && (
+        <div className="mt-3 text-center">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => query.fetchNextPage()}
+            disabled={query.isFetchingNextPage}
+          >
+            {query.isFetchingNextPage ? (
+              <ArrowPathIcon className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              'Load more'
+            )}
+          </Button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export function UserDetail({
+  user,
+  isLoading,
+  onClose,
+  onRemoveUser,
+  isRemovePending,
+  currentMemberRole,
+}: UserDetailProps) {
+  // The account address, or a lead's captured contact address. Both are
+  // sanitised in the DTO (`user.detail.ts`), so a placeholder is already null
+  // and reads here as "no address" rather than as something writable.
+  const displayEmail = user?.email ?? user?.contactEmail ?? null
+  const [removeDialogOpen, setRemoveDialogOpen] = useState(false)
+  const [blockConfirmOpen, setBlockConfirmOpen] = useState(false)
+  const [mergeOpen, setMergeOpen] = useState(false)
+  const [composeOpen, setComposeOpen] = useState(false)
+  const [addToTeamOpen, setAddToTeamOpen] = useState(false)
+  const [changeRoleOpen, setChangeRoleOpen] = useState(false)
+  const addToTeamOpened = useOpenedOnce(addToTeamOpen)
+  const changeRoleOpened = useOpenedOnce(changeRoleOpen)
+  const [isEditing, setIsEditing] = useState(false)
+  const [editName, setEditName] = useState('')
+  const [editEmail, setEditEmail] = useState('')
+  const updateUser = useUpdatePortalUser()
+  const settings = useWorkspaceSettings()
+  const sessionUserId = useSessionContext()?.user?.id ?? null
+  const supportInboxEnabled =
+    (settings?.featureFlags as FeatureFlags | undefined)?.supportInbox ?? false
+  // Check if current user can manage portal users
+  const canManageUsers = currentMemberRole === 'admin'
+  const { blocked, unblock } = usePersonBlockActions(user?.principalId as PrincipalId | undefined)
+  const conversationsQuery = useInfiniteQuery({
+    queryKey: ['admin', 'user-conversations', user?.principalId, 'all'],
+    enabled: supportInboxEnabled && !!user?.principalId,
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ pageParam }) =>
+      listConversationsForUserFn({
+        data: {
+          principalId: user!.principalId as PrincipalId,
+          before: pageParam,
+        },
+      }),
+    getNextPageParam: (last) => (last.hasMore ? (last.nextCursor ?? undefined) : undefined),
+  })
+  const conversationCount = conversationsQuery.data?.pages.flatMap((p) => p.conversations).length
+
+  // Escape goes back to the list, as it deselects there. Not while one of the
+  // profile's dialogs or the inline name edit is open, which Escape closes
+  // instead, nor from a field (menus keep their Escape to themselves).
+  const overlayOpen =
+    removeDialogOpen ||
+    blockConfirmOpen ||
+    mergeOpen ||
+    composeOpen ||
+    addToTeamOpen ||
+    changeRoleOpen ||
+    isEditing
+  useEffect(() => {
+    if (overlayOpen) return
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key !== 'Escape' || e.defaultPrevented) return
+      const target = e.target
+      if (
+        target instanceof Element &&
+        target.closest('input, textarea, select, [contenteditable="true"]')
+      ) {
+        return
+      }
+      onClose()
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [overlayOpen, onClose])
+
+  const startEditing = () => {
+    if (!user) return
+    setEditName(user.name || '')
+    // A lead's editable address is the captured contact email; the account
+    // email behind it is a synthetic placeholder.
+    setEditEmail(user.email ?? user.contactEmail ?? '')
+    setIsEditing(true)
+  }
+
+  const cancelEditing = () => {
+    setIsEditing(false)
+  }
+
+  const saveEdits = () => {
+    if (!user) return
+    const updates: { principalId: string; name?: string; email?: string | null } = {
+      principalId: user.principalId,
+    }
+    const trimmedName = editName.trim()
+    const trimmedEmail = editEmail.trim()
+
+    if (trimmedName && trimmedName !== (user.name || '')) {
+      updates.name = trimmedName
+    }
+    const currentEmail = user.email ?? user.contactEmail ?? null
+    const newEmail = trimmedEmail || null
+    if (newEmail !== currentEmail) {
+      updates.email = newEmail
+    }
+
+    if (!updates.name && updates.email === undefined) {
+      setIsEditing(false)
+      return
+    }
+
+    updateUser.mutate(updates, {
+      onSuccess: () => {
+        setIsEditing(false)
+        toast.success('User updated')
+      },
+      onError: (error) => {
+        toast.error(error instanceof Error ? error.message : 'Failed to update user')
+      },
+    })
+  }
+
+  const backHeader = (
+    <div className="sticky top-0 z-10 bg-background/95 backdrop-blur-sm px-3 py-2.5">
+      <Button variant="ghost" size="sm" onClick={onClose}>
+        <ArrowLeftIcon className="h-4 w-4 mr-1.5" />
+        Back to users
+      </Button>
+    </div>
+  )
+
+  if (isLoading) {
+    return (
+      <div className="max-w-5xl w-full">
+        {backHeader}
+        <DetailSkeleton />
+      </div>
+    )
+  }
+
+  if (!user) {
+    return null
+  }
+
+  const { attributes, externalId } = parseUserMetadata(user.metadata)
+  // The dialogs refetch the detail before they report back, so the badge and
+  // menu follow the server's answer.
+  const teamRole = teamRoleChoice(user.teamRole)
+  const personName = user.name || displayEmail || 'this person'
+  // Only someone who has signed in can join the team from here; others are
+  // invited by email from Members & Teams.
+  const canJoinTeam = !teamRole && !user.isLead && user.hasSignedIn
+  // The server refuses a change to your own role, and blocking or removing
+  // applies to portal users only, never to a teammate.
+  const isSelf = sessionUserId != null && sessionUserId === user.userId
+  const canChangeRole = !!teamRole && !isSelf
+  const portalActions = !teamRole
+  const hasMenu = canChangeRole || canJoinTeam || portalActions
+  const noEmailTooltip = 'This user has no email address to deliver a message to'
+
+  return (
+    <div className="max-w-5xl w-full">
+      {backHeader}
+      <div className="px-6 pb-6">
+        <div className="flex flex-wrap items-start gap-4">
+          <Avatar src={user.image} name={user.name} className="h-16 w-16 shrink-0" />
+          <div className="min-w-0 flex-1">
+            {isEditing ? (
+              <div className="space-y-2">
+                <Input
+                  value={editName}
+                  onChange={(e) => setEditName(e.target.value)}
+                  placeholder="Name"
+                  className="text-sm"
+                />
+                <Input
+                  type="email"
+                  value={editEmail}
+                  onChange={(e) => setEditEmail(e.target.value)}
+                  placeholder="Email (optional)"
+                  className="text-sm"
+                />
+                <div className="flex gap-1.5">
+                  <Button
+                    size="sm"
+                    variant="default"
+                    onClick={saveEdits}
+                    disabled={updateUser.isPending}
+                  >
+                    {updateUser.isPending ? (
+                      <ArrowPathIcon className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <CheckIcon className="h-3.5 w-3.5 mr-1" />
+                    )}
+                    Save
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={cancelEditing}>
+                    <XMarkIcon className="h-3.5 w-3.5 mr-1" />
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="flex min-w-0 items-center gap-2">
+                  <h2 className="min-w-0 truncate text-lg font-semibold leading-7">
+                    {user.name || 'Unnamed user'}
+                  </h2>
+                  {user.emailVerified && (
+                    <CheckCircleIcon className="h-4 w-4 shrink-0 text-primary" />
+                  )}
+                  {teamRole ? (
+                    <Badge className="shrink-0 bg-primary/15 text-foreground">
+                      {teamRole.label}
+                    </Badge>
+                  ) : (
+                    <Badge variant="secondary" className="shrink-0">
+                      {user.isLead ? 'Lead' : 'User'}
+                    </Badge>
+                  )}
+                  {blocked && (
+                    <Badge variant="destructive" className="shrink-0">
+                      Blocked
+                    </Badge>
+                  )}
+                  {canManageUsers && (
+                    <button
+                      type="button"
+                      onClick={startEditing}
+                      className="text-muted-foreground/50 transition-colors hover:text-muted-foreground"
+                      title="Edit user details"
+                    >
+                      <PencilIcon className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+                {displayEmail ? (
+                  <p className="mt-0.5 truncate text-sm text-muted-foreground">{displayEmail}</p>
+                ) : (
+                  <p className="mt-0.5 text-sm italic text-muted-foreground/50">
+                    No email &middot; cannot receive notifications
+                  </p>
+                )}
+              </>
+            )}
+          </div>
+          {!isEditing && (
+            <div className="flex shrink-0 items-center gap-2">
+              {supportInboxEnabled && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => setComposeOpen(true)}
+                        disabled={!displayEmail}
+                      >
+                        <ChatBubbleLeftIcon className="h-4 w-4" />
+                        Send message
+                      </Button>
+                    </span>
+                  </TooltipTrigger>
+                  {!displayEmail && <TooltipContent>{noEmailTooltip}</TooltipContent>}
+                </Tooltip>
+              )}
+              <Button size="sm" variant="outline" asChild>
+                <Link to="/u/$principalId" params={{ principalId: user.principalId }}>
+                  <ArrowTopRightOnSquareIcon className="h-3.5 w-3.5" />
+                  View public profile
+                </Link>
+              </Button>
+              {canManageUsers && hasMenu && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button size="icon-sm" variant="ghost" aria-label="More actions">
+                      <EllipsisHorizontalIcon className="h-4 w-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    {canChangeRole && (
+                      <DropdownMenuItem onClick={() => setChangeRoleOpen(true)}>
+                        <ShieldCheckIcon className="h-4 w-4" />
+                        Change role…
+                      </DropdownMenuItem>
+                    )}
+                    {canJoinTeam && (
+                      <>
+                        <DropdownMenuItem onClick={() => setAddToTeamOpen(true)}>
+                          <UserPlusIcon className="h-4 w-4" />
+                          Make teammate…
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                      </>
+                    )}
+                    {portalActions && (
+                      <>
+                        <DropdownMenuItem
+                          variant={blocked ? 'default' : 'destructive'}
+                          onClick={() => (blocked ? unblock() : setBlockConfirmOpen(true))}
+                        >
+                          <NoSymbolIcon className="h-4 w-4" />
+                          {blocked ? 'Unblock' : 'Block'}
+                        </DropdownMenuItem>
+                        {user.isLead && (
+                          <DropdownMenuItem onClick={() => setMergeOpen(true)}>
+                            <ArrowsRightLeftIcon className="h-4 w-4" />
+                            Merge
+                          </DropdownMenuItem>
+                        )}
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          variant="destructive"
+                          disabled={isRemovePending}
+                          onClick={() => setRemoveDialogOpen(true)}
+                        >
+                          {isRemovePending ? (
+                            <ArrowPathIcon className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <TrashIcon className="h-4 w-4" />
+                          )}
+                          Remove from portal
+                        </DropdownMenuItem>
+                      </>
+                    )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+            </div>
+          )}
+        </div>
+
+        {supportInboxEnabled && (
+          <NewConversationDialog
+            open={composeOpen}
+            onOpenChange={setComposeOpen}
+            initialTarget={{
+              principalId: user.principalId,
+              name: user.name,
+              email: displayEmail,
+              image: user.image,
+            }}
+          />
+        )}
+        {canManageUsers && (
+          <>
+            {canJoinTeam && addToTeamOpened && (
+              <Suspense fallback={null}>
+                <AddPeopleDialog
+                  open={addToTeamOpen}
+                  onOpenChange={setAddToTeamOpen}
+                  canGrantAdmin={canManageUsers}
+                  initialPerson={{
+                    principalId: user.principalId,
+                    name: personName,
+                    avatarUrl: user.image,
+                    detail: displayEmail ?? '',
+                  }}
+                />
+              </Suspense>
+            )}
+            {teamRole && canChangeRole && changeRoleOpened && (
+              <Suspense fallback={null}>
+                <ChangeRoleDialog
+                  open={changeRoleOpen}
+                  onOpenChange={setChangeRoleOpen}
+                  principalId={user.principalId}
+                  personName={personName}
+                  current={teamRole}
+                  canGrantAdmin={canManageUsers}
+                />
+              </Suspense>
+            )}
+            <BlockPersonControl
+              mode="dialog"
+              principalId={user.principalId as PrincipalId}
+              personName={user.name}
+              open={blockConfirmOpen}
+              onOpenChange={setBlockConfirmOpen}
+            />
+            {user.isLead && (
+              <MergeLeadControl
+                mode="dialog"
+                principalId={user.principalId as PrincipalId}
+                leadName={user.name}
+                onMerged={onClose}
+                open={mergeOpen}
+                onOpenChange={setMergeOpen}
+              />
+            )}
+            <ConfirmDialog
+              open={removeDialogOpen}
+              onOpenChange={setRemoveDialogOpen}
+              title={`Remove ${user.name || 'this user'}?`}
+              description="This will remove the user from your portal. They lose access to vote and comment, and their votes are withdrawn. Their posts, comments and conversations stay, reattributed to “Deleted user”. Their global account is preserved and they can sign up again."
+              confirmLabel="Remove"
+              variant="destructive"
+              isPending={isRemovePending}
+              onConfirm={onRemoveUser}
+            />
+          </>
+        )}
+
+        {!isEditing && (
+          <DuplicateUsersWarning
+            principalId={user.principalId as PrincipalId}
+            currentName={user.name}
+            canManage={canManageUsers}
+          />
+        )}
+
+        <div className="mt-4 flex overflow-hidden rounded-lg border border-border/50">
+          <FactCell value={user.postCount} label="Posts" numeric />
+          <FactCell value={user.commentCount} label="Comments" numeric />
+          <FactCell value={user.voteCount} label="Votes" numeric />
+          <FactCell
+            value={user.lastSeenAt ? <TimeAgo date={user.lastSeenAt} /> : NO_VALUE}
+            label="Last seen"
+            muted={!user.lastSeenAt}
+          />
+          <FactCell value={<ProfileDate date={user.joinedAt} />} label="Joined" />
+          <FactCell
+            value={user.country ? countryName(user.country) : NO_VALUE}
+            label="Country"
+            muted={!user.country}
+          />
+        </div>
+
+        <div className="mt-5 flex flex-col items-start gap-6 lg:flex-row">
+          <div className="min-w-0 w-full flex-1">
+            <Tabs defaultValue="activity">
+              <TabsList>
+                <TabsTrigger value="activity">Activity</TabsTrigger>
+                {supportInboxEnabled && (
+                  <TabsTrigger value="conversations">
+                    {conversationCount != null
+                      ? `Conversations (${conversationCount})`
+                      : 'Conversations'}
+                  </TabsTrigger>
+                )}
+              </TabsList>
+              <TabsContent value="activity" className="mt-3">
+                {user.engagedPosts.length === 0 ? (
+                  <div className="rounded-lg border border-dashed border-border/60 px-4 py-6 text-center text-[13px] text-muted-foreground">
+                    No activity yet
+                  </div>
+                ) : (
+                  <div className="overflow-hidden rounded-lg border border-border/50">
+                    {user.engagedPosts.map((post) => (
+                      <EngagedPostCard key={post.id} post={post} />
+                    ))}
+                  </div>
+                )}
+              </TabsContent>
+              {supportInboxEnabled && (
+                <TabsContent value="conversations" className="mt-3">
+                  <UserConversations principalId={user.principalId as PrincipalId} embedded />
+                </TabsContent>
+              )}
+            </Tabs>
+          </div>
+
+          <div className="flex w-full shrink-0 flex-col gap-3 lg:w-[300px]">
+            <RailCard title="Company">
+              <UserCompanyControl
+                principalId={user.principalId as PrincipalId}
+                canManage={canManageUsers}
+              />
+            </RailCard>
+            <RailCard title="Segments">
+              <UserSegmentBadges
+                principalId={user.principalId as PrincipalId}
+                segments={user.segments}
+                canManage={canManageUsers}
+              />
+            </RailCard>
+            <RailCard title="Tags">
+              <UserTagControl
+                principalId={user.principalId as PrincipalId}
+                canManage={canManageUsers}
+              />
+            </RailCard>
+            <RailCard title="Attributes">
+              {attributes.length === 0 ? (
+                <p className="text-xs text-muted-foreground">No attributes</p>
+              ) : (
+                attributes.map(([key, value]) => (
+                  <KvRow key={key} label={key}>
+                    <span className="font-mono text-[11px]">
+                      {value === null ? (
+                        <span className="italic text-muted-foreground/50">null</span>
+                      ) : (
+                        String(value)
+                      )}
+                    </span>
+                  </KvRow>
+                ))
+              )}
+            </RailCard>
+            <RailCard title="Account">
+              <KvRow label="Account created">
+                <ProfileDate date={user.createdAt} />
+              </KvRow>
+              <KvRow label="External ID">
+                {externalId ? (
+                  <span className="font-mono text-[11px]">{externalId}</span>
+                ) : (
+                  NO_VALUE
+                )}
+              </KvRow>
+              {canManageUsers && (
+                <ChangelogSubscriptionControl principalId={user.principalId as PrincipalId} />
+              )}
+            </RailCard>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function FactCell({
+  value,
+  label,
+  numeric = false,
+  muted = false,
+}: {
+  value: ReactNode
+  label: string
+  numeric?: boolean
+  muted?: boolean
+}) {
+  return (
+    <div className="flex-1 border-border/50 px-2 py-2.5 text-center not-last:border-r">
+      <div
+        className={cn(
+          'leading-[22px]',
+          numeric ? 'text-base font-semibold tabular-nums' : 'text-sm font-medium',
+          muted && 'text-muted-foreground'
+        )}
+      >
+        {value}
+      </div>
+      <div className="text-[11px] leading-[15px] text-muted-foreground">{label}</div>
+    </div>
+  )
+}

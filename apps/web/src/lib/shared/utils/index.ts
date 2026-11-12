@@ -1,0 +1,36 @@
+/**
+ * Shared utility functions (client-safe)
+ */
+
+export { cn } from './cn'
+export { nameInitial } from './initial'
+export {
+  getInitials,
+  stripHtml,
+  truncate,
+  formatStatus,
+  getStatusEmoji,
+  stripMarkdownPreview,
+  normalizeStrength,
+  strengthTier,
+  formatBadgeCount,
+} from './string'
+export {
+  escapeHtmlAttr,
+  sanitizeUrl,
+  sanitizeImageUrl,
+  safePositiveInt,
+  extractYoutubeId,
+} from './sanitize'
+export {
+  toIsoString,
+  toIsoStringOrNull,
+  toIsoDateOnly,
+  formatMonthYear,
+  parseCalendarDate,
+  formatCalendarDate,
+  tomorrowAt,
+  startOfUtcMonth,
+  inHours,
+  nextMondayAt,
+} from './date'

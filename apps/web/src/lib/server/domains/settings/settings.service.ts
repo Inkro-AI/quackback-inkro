@@ -1,0 +1,1218 @@
+import {
+  db,
+  eq,
+  settings,
+  sql,
+  ssoVerifiedDomain,
+  type Database,
+  type Transaction,
+} from '@/lib/server/db'
+import type { IdentityProviderId } from '@quackback/ids'
+import { cacheGet, cacheSet, CACHE_KEYS } from '@/lib/server/cache'
+import { localCacheGet, localCacheSet, settingsLocalTtlMs } from '@/lib/server/local-cache'
+import { memoizePerRequest } from '@/lib/server/request-memo'
+import { ValidationError, NotFoundError } from '@/lib/shared/errors'
+import { httpsUrl } from '@/lib/shared/schemas/auth'
+import {
+  assistantConfigSchema,
+  DEFAULT_ASSISTANT_CONFIG,
+  type AssistantCopilotCapabilities,
+} from '@/lib/shared/assistant/config'
+import { assertNotManaged } from '@/lib/server/config-file/managed-guard'
+import { absolutizeOffHostAssetUrl } from '@/lib/server/storage/asset-url'
+import { getPublicUrlOrNull } from '@/lib/server/storage/s3'
+import { logger } from '@/lib/server/logger'
+import type { OidcSignInButton } from '@/lib/shared/oidc-sign-in-button'
+import type {
+  AuthConfig,
+  UpdateAuthConfigInput,
+  PortalConfig,
+  UpdatePortalConfigInput,
+  BrandingConfig,
+  PublicAuthConfig,
+  PublicPortalConfig,
+  DeveloperConfig,
+  UpdateDeveloperConfigInput,
+  FeatureFlags,
+  WorkspaceSettings,
+  SettingsBrandingData,
+  HelpCenterConfig,
+  HelpCenterLocalesConfig,
+  HelpCenterLocaleChromeStrings,
+  VerifiedDomain,
+  PortalWelcomeCard,
+} from './settings.types'
+import {
+  DEFAULT_AUTH_CONFIG,
+  DEFAULT_DEVELOPER_CONFIG,
+  DEFAULT_FEATURE_FLAGS,
+  DEFAULT_HELP_CENTER_CONFIG,
+  resolveFeatureFlags,
+} from './settings.types'
+import { signupOpenFor } from '@/lib/shared/signup-open'
+import { projectPublicWidgetConfig, widgetActivationConfig } from './settings.widget'
+import { getSetupState, isOnboardingComplete } from '@/lib/shared/db-types'
+import { resolveStatusSettings } from './settings.status'
+import {
+  parseJsonConfig,
+  parseJsonOrNull,
+  parseMetadataBag,
+  parsePortalConfig,
+  parseWidgetConfig,
+  deepMerge,
+  requireSettings,
+  requireSettingsCached,
+  wrapDbError,
+  invalidateSettingsCache,
+  normalizeWelcomeCardInput,
+  mergeWelcomeCard,
+  publicWelcomeCard,
+  readSettingsRow,
+  type SettingsFreshness,
+  type SettingsRecord,
+  type SettingsWriteOptions,
+} from './settings.helpers'
+import { withCurrentStorageReadTokens } from '@/lib/server/content/storage-read-urls'
+
+import { logSettingsReadError } from './settings-log'
+import { getTierLimits } from './tier-limits.service'
+import { TierLimitError } from '@/lib/server/errors/tier-limit-error'
+
+const log = logger.child({ component: 'settings' })
+
+/** Mint current `?read=` tokens on a public welcome card. Persist stays unsigned. */
+function liveWelcomeCard(card: PortalWelcomeCard): PortalWelcomeCard {
+  return {
+    ...card,
+    body: withCurrentStorageReadTokens(card.body) as PortalWelcomeCard['body'],
+  }
+}
+
+function liveWorkspaceSettings(settings: WorkspaceSettings): WorkspaceSettings {
+  const publicCfg = settings.publicPortalConfig
+  if (!publicCfg) return settings
+  const welcome = publicWelcomeCard(publicCfg.welcomeCard)
+  return {
+    ...settings,
+    publicPortalConfig: {
+      ...publicCfg,
+      welcomeCard: welcome ? liveWelcomeCard(welcome) : undefined,
+    },
+  }
+}
+
+function offHostPublicUrl(key: string | null | undefined): string | null {
+  const stored = getPublicUrlOrNull(key)
+  return stored ? absolutizeOffHostAssetUrl(stored) : stored
+}
+
+async function getConfiguredAuthTypes(): Promise<Set<string>> {
+  const { getConfiguredIntegrationTypes } =
+    await import('@/lib/server/domains/platform-credentials/platform-credential.service')
+  return getConfiguredIntegrationTypes()
+}
+
+function filterOAuthByCredentials(
+  oauth: Record<string, boolean | undefined>,
+  configuredTypes: Set<string>,
+  passthroughKeys: string[]
+): Record<string, boolean | undefined> {
+  const passthrough = new Set(passthroughKeys)
+  const filtered: Record<string, boolean | undefined> = {}
+  for (const [key, enabled] of Object.entries(oauth)) {
+    if (passthrough.has(key)) {
+      filtered[key] = enabled
+    } else {
+      filtered[key] = enabled && configuredTypes.has(`auth_${key}`)
+    }
+  }
+  return filtered
+}
+
+/**
+ * Email-dependent passthrough keys for `filterOAuthByCredentials`.
+ * Shared by both team and portal surfaces — neither has an
+ * `auth_password` / `auth_magicLink` credential row (they use the
+ * SMTP transport, not OAuth secrets), so they'd otherwise be dropped
+ * by the OAuth-credential gate.
+ *
+ * `password` is always passthrough — the team and portal both use
+ * stored credential hashes, not SMTP. `magicLink` only renders when
+ * an outbound transport is wired so we don't surface a button that
+ * would silently fail.
+ */
+async function getEmailDependentPassthroughKeys(): Promise<string[]> {
+  const { isEmailConfigured } = await import('@quackback/email')
+  return isEmailConfigured() ? ['magicLink', 'password'] : ['password']
+}
+
+/**
+ * Public OIDC sign-in buttons for the portal, sourced from the
+ * `identity_provider` table (NOT the static AUTH_PROVIDERS map). Each
+ * button's `id` is the provider's `registrationId`, so a click drives
+ * `signIn.social({ provider: registrationId })` →
+ * `/api/auth/callback/<registrationId>`. A return to the legacy
+ * `/api/auth/oauth2/callback/<registrationId>` URL, which providers on the
+ * legacy redirect style send, is rewritten onto that path.
+ *
+ * A provider yields a button only when it is BOTH:
+ *   - button-eligible (`shouldRenderPublicButton`): no verified domain,
+ *     or the admin opted a routed provider back in via `showButton`.
+ *   - registered (`getRegisteredOidcProviderIds`): the same gate the auth
+ *     runtime applies (enabled + creds + tier) so a button never 404s.
+ *
+ * Routed-only providers (verified domain + `showButton:false`) are
+ * reached via the email-first SSO routing, so they're excluded here.
+ */
+export async function getPublicOidcProviders(
+  /** The settings row's raw `auth_config`, which every caller already holds. */
+  authConfig: string | null | undefined
+): Promise<OidcSignInButton[]> {
+  const { listIdentityProviders, shouldRenderPublicButton } =
+    await import('./identity-providers.service')
+  const { getRegisteredOidcProviderIds } = await import('@/lib/server/auth/registered-providers')
+
+  const providers = await listIdentityProviders({ authConfig: authConfig ?? null })
+  // No providers → no buttons; skip the tier + credential round-trips.
+  if (providers.length === 0) return []
+  const registered = await getRegisteredOidcProviderIds(providers)
+
+  return providers
+    .filter((p) => registered.has(p.registrationId) && shouldRenderPublicButton(p))
+    .map((p) => ({ id: p.registrationId, name: p.label, logoUrl: p.logoUrl }))
+}
+
+export async function getAuthConfig(freshness: SettingsFreshness = 'cached'): Promise<AuthConfig> {
+  try {
+    const org = await readSettingsRow(freshness)
+    return parseJsonConfig(org.authConfig, DEFAULT_AUTH_CONFIG)
+  } catch (error) {
+    logSettingsReadError(log, error, 'get auth config failed')
+    wrapDbError('fetch auth config', error)
+  }
+}
+
+/**
+ * OAuth providers that are always available regardless of tier.
+ * Anything outside this set requires the customOidcProvider feature flag.
+ */
+const STANDARD_OAUTH_PROVIDERS = new Set(['google', 'github', 'microsoft', 'discord'])
+
+export async function updateAuthConfig(input: UpdateAuthConfigInput): Promise<AuthConfig> {
+  log.info('update auth config')
+  try {
+    if (input.twoFactor) {
+      for (const key of Object.keys(input.twoFactor)) {
+        await assertNotManaged(`auth.twoFactor.${key}`)
+      }
+    }
+
+    // Tier gate: refuse non-standard OAuth providers when
+    // customOidcProvider is off. No-op when the feature is unlimited.
+    if (input.oauth) {
+      const enablingNonStandard = Object.entries(input.oauth).some(
+        ([id, enabled]) => enabled && !STANDARD_OAUTH_PROVIDERS.has(id)
+      )
+      if (enablingNonStandard) {
+        const { assertTierFeature } = await import('@/lib/server/domains/settings/tier-enforce')
+        await assertTierFeature('customOidcProvider', 'Custom OIDC providers')
+      }
+    }
+
+    // Tier gate: ssoOidc itself requires customOidcProvider. Reject
+    // attempts to enable or configure SSO when the tier is off.
+    if (input.ssoOidc?.enabled === true) {
+      const { assertTierFeature } = await import('@/lib/server/domains/settings/tier-enforce')
+      await assertTierFeature('customOidcProvider', 'Single sign-on (OIDC)')
+
+      // Secret-presence gate: enabling SSO without a saved client
+      // secret would register a Better-Auth provider that 4xxs on
+      // every callback. Force the admin to paste the secret first via
+      // the UI's ClientSecretField component (which writes to
+      // platform_credentials and triggers a rebuild on save).
+      const { ValidationError } = await import('@/lib/shared/errors')
+      const { hasSsoClientSecret } = await import('@/lib/server/auth/sso-secret')
+      if (!(await hasSsoClientSecret())) {
+        throw new ValidationError(
+          'SSO_NO_CLIENT_SECRET',
+          'Save the SSO client secret before enabling SSO sign-in.'
+        )
+      }
+    }
+
+    // Enum guard for autoProvisionRole. Runs before the DB read so a
+    // malformed API call (e.g. `{ ssoOidc: { autoProvisionRole: 'root' } }`)
+    // can't poison the stored JSON blob. The JIT hook downstream trusts
+    // this field to map to a known role.
+    if (input.ssoOidc?.autoProvisionRole !== undefined) {
+      const allowed = ['admin', 'member', 'user'] as const
+      if (!allowed.includes(input.ssoOidc.autoProvisionRole as (typeof allowed)[number])) {
+        throw new ValidationError(
+          'INVALID_SSO_CONFIG',
+          `autoProvisionRole must be one of ${allowed.join(', ')}.`
+        )
+      }
+    }
+
+    const org = await requireSettings()
+    const existing = parseJsonConfig(org.authConfig, DEFAULT_AUTH_CONFIG)
+    const updated = deepMerge(existing, input as Partial<AuthConfig>)
+
+    // Coupling invariant: `twoFactor.required=true` is only meaningful
+    // when `oauth.password=true`. The inline enrollment and TOTP
+    // challenge in the auth dialog are triggered exclusively on the
+    // password sign-in path — magic-link, SSO, and non-SSO OAuth all
+    // bypass them. Persisting `required=true` while password is off
+    // stores a toggle that does nothing at runtime, which misleads
+    // admins reading the settings page ("my team is 2FA-protected")
+    // and pollutes audit dumps. Reject the combination at write time;
+    // migration 0061 normalized any pre-existing inert state.
+    //
+    // `password` defaults to `true` when the key is absent (matches
+    // `DEFAULT_AUTH_CONFIG` + `isAuthMethodAllowed`'s `?? true`), so
+    // we only refuse when it's *explicitly* false.
+    if (updated.twoFactor?.required === true && updated.oauth?.password === false) {
+      const { ValidationError } = await import('@/lib/shared/errors')
+      throw new ValidationError(
+        'TWO_FACTOR_REQUIRES_PASSWORD',
+        'Two-factor enforcement only applies to password sign-in. Enable Password sign-in first, or disable Require 2FA before turning off Password.'
+      )
+    }
+
+    // Partial-write validation: a naked `{ ssoOidc: { enabled: true } }`
+    // shouldn't land in DB if the stored ssoOidc is missing discoveryUrl
+    // / clientId — the runtime would skip registration and the workspace
+    // would have an orphaned half-config.
+    if (updated.ssoOidc) {
+      const isHttps = httpsUrl.safeParse(updated.ssoOidc.discoveryUrl ?? '').success
+      if (updated.ssoOidc.enabled) {
+        if (!updated.ssoOidc.discoveryUrl || !updated.ssoOidc.clientId || !isHttps) {
+          throw new ValidationError(
+            'INVALID_SSO_CONFIG',
+            'SSO requires an https:// discoveryUrl and clientId when enabled.'
+          )
+        }
+      }
+
+      // Stamp `detailsChangedAt` when a connection-affecting field
+      // changed (discoveryUrl / clientId). A brand-new ssoOidc block
+      // (no prior) also counts as "changed" — it has never been tested.
+      // autoCreateUsers / autoProvisionRole / attributeMapping don't
+      // affect the IdP handshake, so they don't reset the timestamp.
+      // The client secret is handled separately by setSsoClientSecretFn.
+      const prevSso = existing.ssoOidc
+      const detailsChanged =
+        !prevSso ||
+        updated.ssoOidc.discoveryUrl !== prevSso.discoveryUrl ||
+        updated.ssoOidc.clientId !== prevSso.clientId
+      if (detailsChanged) {
+        updated.ssoOidc.detailsChangedAt = new Date().toISOString()
+      }
+
+      // Gate the off→on transition: enabling SSO requires a successful
+      // test sign-in performed AFTER the most recent details change.
+      // Transition-only — a config save that round-trips an already-on
+      // `enabled` (e.g. editing autoProvisionRole) is never blocked, and
+      // changing the discovery URL while enabled stamps detailsChangedAt
+      // but doesn't kick the workspace out of SSO.
+      const wasEnabled = prevSso?.enabled === true
+      if (updated.ssoOidc.enabled === true && !wasEnabled) {
+        const { isSsoTestValid } = await import('@/lib/server/auth/sso-gates')
+        if (!isSsoTestValid(updated.ssoOidc)) {
+          throw new ValidationError(
+            'SSO_TEST_REQUIRED',
+            'Run a successful test sign-in before enabling SSO.'
+          )
+        }
+      }
+      // Block private/loopback/link-local discovery URLs at write time
+      // so the auth runtime never gets handed an SSRF target. Only when
+      // the URL actually changed — `checkUrlSafety` is a DNS round-trip,
+      // and an unchanged URL was already validated when it was written.
+      const discoveryUrlChanged = !prevSso || updated.ssoOidc.discoveryUrl !== prevSso.discoveryUrl
+      if (discoveryUrlChanged && isHttps && updated.ssoOidc.discoveryUrl) {
+        const { checkUrlSafety } = await import('@/lib/server/content/ssrf-guard')
+        const safety = await checkUrlSafety(updated.ssoOidc.discoveryUrl)
+        if (!safety.safe) {
+          throw new ValidationError(
+            'INVALID_SSO_CONFIG',
+            safety.reason === 'ssrf-rejected'
+              ? 'Discovery URL must point to a public IdP, not a private or loopback address.'
+              : 'Discovery URL is not a valid https:// URL.'
+          )
+        }
+      }
+    }
+
+    // Atomic bump of auth_config_version + the JSON write in the same
+    // transaction. Without the version bump other pods would keep
+    // stale Better-Auth instances until their next cache TTL expiry.
+    const { bumpAuthConfigVersionInTx } = await import('@/lib/server/auth/config-version')
+    const { resetAuth } = await import('@/lib/server/auth')
+    await db.transaction(async (tx) => {
+      // Everything above decided on a read taken outside any lock, and holds
+      // no lock across its DNS checks. `oidcRedirectStyles` is not this
+      // writer's to change, so take it from the row as it stands now, under
+      // the lock the identity-provider service also writes it under, rather
+      // than writing back the copy read earlier.
+      const [locked] = await tx
+        .select({ authConfig: settings.authConfig })
+        .from(settings)
+        .limit(1)
+        .for('update')
+      const current = parseJsonConfig(locked?.authConfig ?? null, DEFAULT_AUTH_CONFIG)
+      const { oidcRedirectStyles: _stale, ...ours } = updated
+      await tx
+        .update(settings)
+        .set({
+          authConfig: JSON.stringify(
+            current.oidcRedirectStyles
+              ? { ...ours, oidcRedirectStyles: current.oidcRedirectStyles }
+              : ours
+          ),
+        })
+        .where(eq(settings.id, org.id))
+      await bumpAuthConfigVersionInTx(tx)
+    })
+    // invalidateSettingsCache drops the Redis cache entry so other pods
+    // re-read the bumped version on next request. The local resetAuth
+    // skips the next-request wait on the calling pod.
+    resetAuth()
+    await invalidateSettingsCache()
+    return updated
+  } catch (error) {
+    log.error({ err: error }, 'update auth config failed')
+    wrapDbError('update auth config', error)
+  }
+}
+
+/**
+ * Shallow-merge a patch into the stored `ssoOidc` block + invalidate the
+ * settings cache. Used by the `lastSuccessfulTestAt` stamping helper below.
+ * No-op when no ssoOidc block exists.
+ *
+ * Deliberately skips the `auth_config_version` bump + `resetAuth()` that
+ * `updateAuthConfig` does: `detailsChangedAt` / `lastSuccessfulTestAt`
+ * are gate metadata read by server fns, not by the Better-Auth runtime,
+ * so there's nothing for it to rebuild. Dropping the version bump avoids
+ * a cross-pod Better-Auth rebuild on every test sign-in.
+ */
+async function patchSsoOidc(patch: Partial<NonNullable<AuthConfig['ssoOidc']>>): Promise<void> {
+  // Read-modify-write under the row lock, so a concurrent writer of another
+  // key (the identity-provider service's `oidcRedirectStyles`) is not undone
+  // by a copy read before it committed.
+  const wrote = await db.transaction(async (tx) => {
+    const [org] = await tx
+      .select({ id: settings.id, authConfig: settings.authConfig })
+      .from(settings)
+      .limit(1)
+      .for('update')
+    if (!org) return false
+    const existing = parseJsonConfig(org.authConfig, DEFAULT_AUTH_CONFIG)
+    if (!existing.ssoOidc) return false
+    const updated: AuthConfig = {
+      ...existing,
+      ssoOidc: { ...existing.ssoOidc, ...patch },
+    }
+    await tx
+      .update(settings)
+      .set({ authConfig: JSON.stringify(updated) })
+      .where(eq(settings.id, org.id))
+    return true
+  })
+  if (wrote) await invalidateSettingsCache()
+}
+
+/**
+ * Stamp `ssoOidc.lastSuccessfulTestAt = now`. Called by the SSO test
+ * callback when a test sign-in succeeds AND the IdP-returned email
+ * matches the admin who ran it. Compared against `detailsChangedAt`
+ * to gate enabling SSO and per-domain enforcement.
+ */
+export async function markSsoTestSucceeded(): Promise<void> {
+  log.info('mark sso test succeeded')
+  try {
+    await patchSsoOidc({ lastSuccessfulTestAt: new Date().toISOString() })
+  } catch (error) {
+    log.error({ err: error }, 'mark sso test succeeded failed')
+    wrapDbError('mark sso test succeeded', error)
+  }
+}
+
+/**
+ * Verified-domain CRUD lives in its own table (`sso_verified_domain`)
+ * since multi-domain. Each write bumps `auth_config_version` so cached
+ * Better-Auth instances on other pods rebuild on their next request —
+ * mirrors the invalidation pattern of `updateAuthConfig`.
+ */
+export const MAX_VERIFIED_DOMAINS = 10
+
+function rowToVerifiedDomain(row: typeof ssoVerifiedDomain.$inferSelect): VerifiedDomain {
+  return {
+    id: row.id,
+    name: row.name,
+    verificationToken: row.verificationToken,
+    verifiedAt: row.verifiedAt ? row.verifiedAt.toISOString() : null,
+    enforced: row.enforced,
+    providerId: row.providerId,
+    createdAt: row.createdAt.toISOString(),
+  }
+}
+
+/** Random base32-style token used as the DNS TXT value. 15 random bytes
+ *  → 24 chars of Crockford base32 (no look-alike characters). */
+function generateVerificationToken(): string {
+  const ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
+  const buf = new Uint8Array(15)
+  crypto.getRandomValues(buf)
+  let bits = 0
+  let value = 0
+  let out = ''
+  for (const b of buf) {
+    value = (value << 8) | b
+    bits += 8
+    while (bits >= 5) {
+      out += ALPHABET[(value >>> (bits - 5)) & 31]
+      bits -= 5
+    }
+  }
+  if (bits > 0) out += ALPHABET[(value << (5 - bits)) & 31]
+  return out
+}
+
+/**
+ * Insert a verified-domain row for `name`. Idempotent: if a row with
+ * that name already exists, returns the existing row (preserves its
+ * pending/verified state and token). Caps at MAX_VERIFIED_DOMAINS.
+ *
+ * `providerId` links the domain to an identity provider. On insert it is
+ * stamped onto the new row; on the idempotent path an already-existing
+ * but *unlinked* row is adopted by the given provider (a previously
+ * global / backfilled domain). A row already owned by another provider is
+ * returned untouched — `name` is globally unique, so a domain belongs to
+ * exactly one provider.
+ */
+export async function insertVerifiedDomain(
+  name: string,
+  providerId?: IdentityProviderId
+): Promise<VerifiedDomain> {
+  log.info({ name, providerId }, 'insert verified domain')
+  try {
+    const { bumpAuthConfigVersionInTx } = await import('@/lib/server/auth/config-version')
+    const { resetAuth } = await import('@/lib/server/auth')
+
+    const inserted = await db.transaction(async (tx) => {
+      const existing = await tx
+        .select()
+        .from(ssoVerifiedDomain)
+        .where(eq(ssoVerifiedDomain.name, name))
+      if (existing.length > 0) {
+        const current = existing[0]
+        // Adopt a previously-unlinked domain into the requesting provider.
+        if (providerId && current.providerId === null) {
+          const [relinked] = await tx
+            .update(ssoVerifiedDomain)
+            .set({ providerId })
+            .where(eq(ssoVerifiedDomain.id, current.id))
+            .returning()
+          await bumpAuthConfigVersionInTx(tx)
+          return { row: relinked, changed: true }
+        }
+        return { row: current, changed: false }
+      }
+      const count = await tx.$count(ssoVerifiedDomain)
+      if (count >= MAX_VERIFIED_DOMAINS) {
+        throw new ValidationError(
+          'MAX_DOMAINS_REACHED',
+          `Maximum of ${MAX_VERIFIED_DOMAINS} verified domains reached.`
+        )
+      }
+      const [row] = await tx
+        .insert(ssoVerifiedDomain)
+        .values({
+          name,
+          verificationToken: generateVerificationToken(),
+          providerId: providerId ?? null,
+        })
+        .returning()
+      await bumpAuthConfigVersionInTx(tx)
+      return { row, changed: true }
+    })
+    if (inserted.changed) {
+      resetAuth()
+      await invalidateSettingsCache()
+    }
+    return rowToVerifiedDomain(inserted.row)
+  } catch (error) {
+    log.error({ err: error }, 'insert verified domain failed')
+    wrapDbError('insert verified domain', error)
+  }
+}
+
+/** Remove a verified-domain row by id. No-op if the row doesn't exist. */
+export async function removeVerifiedDomain(id: `domain_${string}`): Promise<void> {
+  log.info({ id }, 'remove verified domain')
+  try {
+    const { bumpAuthConfigVersionInTx } = await import('@/lib/server/auth/config-version')
+    const { resetAuth } = await import('@/lib/server/auth')
+
+    const removed = await db.transaction(async (tx) => {
+      const deleted = await tx
+        .delete(ssoVerifiedDomain)
+        .where(eq(ssoVerifiedDomain.id, id))
+        .returning({ id: ssoVerifiedDomain.id })
+      if (deleted.length === 0) return false
+      await bumpAuthConfigVersionInTx(tx)
+      return true
+    })
+    if (removed) {
+      resetAuth()
+      await invalidateSettingsCache()
+    }
+  } catch (error) {
+    log.error({ err: error }, 'remove verified domain failed')
+    wrapDbError('remove verified domain', error)
+  }
+}
+
+/**
+ * Stamp `verifiedAt` on a verified-domain row — race-protected by an
+ * expected-token check inside the same transaction. Surfaces
+ * STALE_VERIFICATION_TOKEN when the row has been rotated or removed
+ * between the caller's read-of-token and the DNS lookup.
+ */
+export async function stampVerifiedDomain(input: {
+  id: `domain_${string}`
+  expectedToken: string
+  verifiedAt: string
+}): Promise<VerifiedDomain> {
+  log.info({ id: input.id }, 'stamp verified domain')
+  try {
+    const { bumpAuthConfigVersionInTx } = await import('@/lib/server/auth/config-version')
+    const { resetAuth } = await import('@/lib/server/auth')
+
+    const updated = await db.transaction(async (tx) => {
+      const [current] = await tx
+        .select()
+        .from(ssoVerifiedDomain)
+        .where(eq(ssoVerifiedDomain.id, input.id))
+      if (!current || current.verificationToken !== input.expectedToken) {
+        throw new ValidationError(
+          'STALE_VERIFICATION_TOKEN',
+          'Domain changed during verification. Refresh and try again.'
+        )
+      }
+      const [row] = await tx
+        .update(ssoVerifiedDomain)
+        .set({ verifiedAt: new Date(input.verifiedAt) })
+        .where(eq(ssoVerifiedDomain.id, input.id))
+        .returning()
+      await bumpAuthConfigVersionInTx(tx)
+      return row
+    })
+    resetAuth()
+    await invalidateSettingsCache()
+    return rowToVerifiedDomain(updated)
+  } catch (error) {
+    log.error({ err: error }, 'stamp verified domain failed')
+    wrapDbError('stamp verified domain', error)
+  }
+}
+
+/** Flip the per-domain enforcement flag. Workspace-scoped bootstrap
+ *  precondition (recent SSO sign-in + email configured) is enforced
+ *  upstream in the server function. */
+export async function setVerifiedDomainEnforced(
+  id: `domain_${string}`,
+  enforced: boolean
+): Promise<VerifiedDomain> {
+  log.info({ id, enforced }, 'set verified domain enforced')
+  try {
+    const { bumpAuthConfigVersionInTx } = await import('@/lib/server/auth/config-version')
+    const { resetAuth } = await import('@/lib/server/auth')
+
+    const updated = await db.transaction(async (tx) => {
+      const [row] = await tx
+        .update(ssoVerifiedDomain)
+        .set({ enforced })
+        .where(eq(ssoVerifiedDomain.id, id))
+        .returning()
+      if (!row) {
+        throw new ValidationError('VERIFIED_DOMAIN_NOT_FOUND', 'Domain not found.')
+      }
+      await bumpAuthConfigVersionInTx(tx)
+      return row
+    })
+    resetAuth()
+    await invalidateSettingsCache()
+    return rowToVerifiedDomain(updated)
+  } catch (error) {
+    log.error({ err: error }, 'set verified domain enforced failed')
+    wrapDbError('set verified domain enforced', error)
+  }
+}
+
+export async function listVerifiedDomains(): Promise<VerifiedDomain[]> {
+  try {
+    const rows = await db.select().from(ssoVerifiedDomain).orderBy(ssoVerifiedDomain.createdAt)
+    return rows.map(rowToVerifiedDomain)
+  } catch (error) {
+    log.error({ err: error }, 'list verified domains failed')
+    wrapDbError('list verified domains', error)
+  }
+}
+
+export async function getPortalConfig(
+  freshness: SettingsFreshness = 'cached'
+): Promise<PortalConfig> {
+  try {
+    const org = await readSettingsRow(freshness)
+    return parsePortalConfig(org.portalConfig)
+  } catch (error) {
+    logSettingsReadError(log, error, 'get portal config failed')
+    wrapDbError('fetch portal config', error)
+  }
+}
+
+export async function updatePortalConfig(input: UpdatePortalConfigInput): Promise<PortalConfig> {
+  log.info('update portal config')
+  try {
+    const normalizedWelcome = normalizeWelcomeCardInput(input.welcomeCard)
+    const inputWithoutWelcome: UpdatePortalConfigInput = { ...input }
+    delete inputWithoutWelcome.welcomeCard
+    const org = await requireSettings()
+    const existing = parsePortalConfig(org.portalConfig)
+    const updated = deepMerge(existing, inputWithoutWelcome as Partial<PortalConfig>)
+    // welcomeCard.body must replace, not deep-merge — see mergeWelcomeCard.
+    if (normalizedWelcome) {
+      updated.welcomeCard = mergeWelcomeCard(existing.welcomeCard, normalizedWelcome)
+    }
+
+    await db
+      .update(settings)
+      .set({ portalConfig: JSON.stringify(updated) })
+      .where(eq(settings.id, org.id))
+    await invalidateSettingsCache()
+    return updated
+  } catch (error) {
+    log.error({ err: error }, 'update portal config failed')
+    wrapDbError('update portal config', error)
+  }
+}
+
+export async function getDeveloperConfig(): Promise<DeveloperConfig> {
+  try {
+    const org = await requireSettingsCached()
+    return parseJsonConfig(org.developerConfig, DEFAULT_DEVELOPER_CONFIG)
+  } catch (error) {
+    log.error({ err: error }, 'get developer config failed')
+    wrapDbError('fetch developer config', error)
+  }
+}
+
+export async function updateDeveloperConfig(
+  input: UpdateDeveloperConfigInput
+): Promise<DeveloperConfig> {
+  log.info('update developer config')
+  try {
+    // Plan first (names the plan), then the operator-cap overlay. Disabling MCP
+    // stays open so a downgraded workspace can turn the endpoint off.
+    if (input.mcpEnabled === true) {
+      const { requireEntitlement } =
+        await import('@/lib/server/domains/settings/cloud/entitlements')
+      await requireEntitlement('mcpServer')
+      const { assertTierFeature } = await import('@/lib/server/domains/settings/tier-enforce')
+      await assertTierFeature('mcpServer', 'MCP server')
+    }
+
+    const org = await requireSettings()
+    const existing = parseJsonConfig(org.developerConfig, DEFAULT_DEVELOPER_CONFIG)
+    const updated = deepMerge(existing, input as Partial<DeveloperConfig>)
+
+    const writeConfig = (executor: Database | Transaction) =>
+      executor
+        .update(settings)
+        .set({ developerConfig: JSON.stringify(updated) })
+        .where(eq(settings.id, org.id))
+
+    // The oauthProvider plugin reads the dynamic-client-registration toggle
+    // at auth-instance build time, so a change must bump auth_config_version
+    // in the same transaction to rebuild cached Better-Auth instances on
+    // every pod (same pattern as updateAuthConfig).
+    if (
+      updated.oauthDynamicClientRegistrationEnabled !==
+      existing.oauthDynamicClientRegistrationEnabled
+    ) {
+      const { bumpAuthConfigVersionInTx } = await import('@/lib/server/auth/config-version')
+      const { resetAuth } = await import('@/lib/server/auth')
+      await db.transaction(async (tx) => {
+        await writeConfig(tx)
+        await bumpAuthConfigVersionInTx(tx)
+      })
+      resetAuth()
+    } else {
+      await writeConfig(db)
+    }
+    await invalidateSettingsCache()
+    return updated
+  } catch (error) {
+    log.error({ err: error }, 'update developer config failed')
+    wrapDbError('update developer config', error)
+  }
+}
+
+export async function getHelpCenterConfig(
+  freshness: SettingsFreshness = 'cached'
+): Promise<HelpCenterConfig> {
+  try {
+    const org = await readSettingsRow(freshness)
+    return parseJsonConfig(org.helpCenterConfig, DEFAULT_HELP_CENTER_CONFIG)
+  } catch (error) {
+    log.error({ err: error }, 'get help center config failed')
+    wrapDbError('fetch help center config', error)
+  }
+}
+
+/**
+ * A help-center update. `seo` and `autoTranslate` may be partial: they are
+ * merged over the stored section, so a caller never sends back a copy it read.
+ */
+export type HelpCenterConfigUpdate = Omit<Partial<HelpCenterConfig>, 'seo' | 'autoTranslate'> & {
+  seo?: Partial<HelpCenterConfig['seo']>
+  autoTranslate?: Partial<HelpCenterConfig['autoTranslate']>
+}
+
+export async function updateHelpCenterConfig(
+  input: HelpCenterConfigUpdate
+): Promise<HelpCenterConfig> {
+  log.info('update help center config')
+  try {
+    const org = await requireSettings()
+    const existing = parseJsonConfig(org.helpCenterConfig, DEFAULT_HELP_CENTER_CONFIG)
+    const updated = deepMerge(existing, input as Partial<HelpCenterConfig>)
+    await db
+      .update(settings)
+      .set({ helpCenterConfig: JSON.stringify(updated) })
+      .where(eq(settings.id, org.id))
+    await invalidateSettingsCache()
+    return updated
+  } catch (error) {
+    log.error({ err: error }, 'update help center config failed')
+    wrapDbError('update help center config', error)
+  }
+}
+
+/**
+ * Enable an additional help-center locale (domains/languages §2). Requires a
+ * non-empty homepage title: a locale with no
+ * chrome strings has nothing to show on its own homepage. Idempotent --
+ * re-enabling an already-enabled locale just replaces its chrome.
+ */
+export async function enableHelpCenterLocale(input: {
+  locale: string
+  chrome: HelpCenterLocaleChromeStrings
+}): Promise<HelpCenterLocalesConfig> {
+  if (!input.chrome.homepageTitle.trim()) {
+    throw new ValidationError(
+      'HC_LOCALE_TITLE_REQUIRED',
+      'Enabling a locale requires a homepage title'
+    )
+  }
+  const limit = (await getTierLimits()).maxHelpCenterLocales
+  // The lock is held to the end of the transaction, so two concurrent enables
+  // read the same language count only one at a time and cannot both take the
+  // last slot. The read and the write both run on the transaction.
+  const locales = await db.transaction(async (tx) => {
+    await tx.execute(
+      sql`SELECT pg_advisory_xact_lock(hashtext('quackback:help_center_locale_slot'))`
+    )
+    const org = await requireSettings(tx)
+    const existing = parseJsonConfig(org.helpCenterConfig, DEFAULT_HELP_CENTER_CONFIG)
+    if (input.locale === existing.locales.default) {
+      throw new ValidationError('HC_LOCALE_IS_DEFAULT', 'The default locale is always enabled')
+    }
+    const alreadyEnabled = existing.locales.additional.includes(input.locale)
+    if (!alreadyEnabled && limit !== null) {
+      // The default language counts toward the plan's language cap.
+      const enabled = 1 + existing.locales.additional.length
+      if (enabled >= limit) {
+        throw new TierLimitError({
+          limit: 'maxHelpCenterLocales',
+          current: enabled,
+          max: limit,
+          message: `You've reached your plan's help center languages limit (${limit}). Upgrade to add more.`,
+        })
+      }
+    }
+    const additional = alreadyEnabled
+      ? existing.locales.additional
+      : [...existing.locales.additional, input.locale]
+    const next = deepMerge(existing, {
+      locales: {
+        ...existing.locales,
+        additional,
+        chrome: { ...existing.locales.chrome, [input.locale]: input.chrome },
+      },
+    } as Partial<HelpCenterConfig>)
+    await tx
+      .update(settings)
+      .set({ helpCenterConfig: JSON.stringify(next) })
+      .where(eq(settings.id, org.id))
+    return next.locales
+  })
+  await invalidateSettingsCache()
+  return locales
+}
+
+/** Disabling a locale keeps its translation rows (re-enabling picks them back up). */
+export async function disableHelpCenterLocale(locale: string): Promise<HelpCenterLocalesConfig> {
+  const current = await getHelpCenterConfig('fresh')
+  const updated = await updateHelpCenterConfig({
+    locales: {
+      ...current.locales,
+      additional: current.locales.additional.filter((l) => l !== locale),
+    },
+  })
+  return updated.locales
+}
+
+export async function updateHelpCenterLocaleChrome(input: {
+  locale: string
+  chrome: Partial<HelpCenterLocaleChromeStrings>
+}): Promise<HelpCenterLocalesConfig> {
+  const current = await getHelpCenterConfig('fresh')
+  if (!current.locales.additional.includes(input.locale)) {
+    throw new NotFoundError('HC_LOCALE_NOT_ENABLED', 'That locale is not enabled')
+  }
+  const existingChrome = current.locales.chrome[input.locale] ?? {
+    homepageTitle: '',
+    homepageDescription: '',
+    searchPlaceholder: '',
+  }
+  const updated = await updateHelpCenterConfig({
+    locales: {
+      ...current.locales,
+      chrome: {
+        ...current.locales.chrome,
+        [input.locale]: { ...existingChrome, ...input.chrome },
+      },
+    },
+  })
+  return updated.locales
+}
+
+export async function getPublicAuthConfig(): Promise<PublicAuthConfig> {
+  try {
+    const org = await requireSettingsCached()
+    const authConfig = parseJsonConfig(org.authConfig, DEFAULT_AUTH_CONFIG)
+
+    const [configuredTypes, passthroughKeys] = await Promise.all([
+      getConfiguredAuthTypes(),
+      getEmailDependentPassthroughKeys(),
+    ])
+    const filteredOAuth = filterOAuthByCredentials(
+      authConfig.oauth,
+      configuredTypes,
+      passthroughKeys
+    )
+    return {
+      oauth: filteredOAuth,
+      openSignup: authConfig.openSignup,
+      twoFactor: { required: authConfig.twoFactor?.required ?? false },
+    }
+  } catch (error) {
+    logSettingsReadError(log, error, 'get public auth config failed')
+    wrapDbError('fetch public auth config', error)
+  }
+}
+
+export async function getPublicPortalConfig(): Promise<PublicPortalConfig> {
+  try {
+    const org = await requireSettingsCached()
+    const portalConfig = parsePortalConfig(org.portalConfig)
+
+    const oidcProviders = await getPublicOidcProviders(org.authConfig)
+    const welcome = publicWelcomeCard(portalConfig.welcomeCard)
+    const authConfig = parseJsonConfig(org.authConfig, DEFAULT_AUTH_CONFIG)
+    return {
+      openSignup: signupOpenFor({ authConfig, portalConfig }, 'portal'),
+      features: {
+        allowAnonymous: portalConfig.features.allowAnonymous,
+        allowEditAfterEngagement: portalConfig.features.allowEditAfterEngagement,
+        allowDeleteAfterEngagement: portalConfig.features.allowDeleteAfterEngagement,
+        showPublicEditHistory: portalConfig.features.showPublicEditHistory,
+      },
+      ...(oidcProviders.length > 0 && { oidcProviders }),
+      ...(welcome && { welcomeCard: liveWelcomeCard(welcome) }),
+      portalAccess: {
+        isPrivate: portalConfig.access?.visibility === 'private',
+        widgetSignIn: portalConfig.access?.widgetSignIn ?? false,
+      },
+    }
+  } catch (error) {
+    logSettingsReadError(log, error, 'get public portal config failed')
+    wrapDbError('fetch public portal config', error)
+  }
+}
+
+// WorkspaceSettings and SettingsBrandingData are defined in settings.types.ts
+// to prevent client-side barrel imports from pulling in this server-only module.
+
+/**
+ * The workspace settings with every config parsed, read at most once per
+ * request: the auth instance's version check, its hooks, the bootstrap payload
+ * and the auth helpers all ask for them. The request memo is keyed by the
+ * cache key, so `invalidateSettingsCache()` drops it along with the cached row.
+ * Each caller gets its own copy, as it did when every call parsed its own read.
+ */
+export async function getWorkspaceSettings(): Promise<WorkspaceSettings | null> {
+  const settings = await memoizePerRequest(CACHE_KEYS.WORKSPACE_SETTINGS, loadWorkspaceSettings)
+  return settings ? liveWorkspaceSettings(structuredClone(settings)) : null
+}
+
+/**
+ * The raw row inside {@link getWorkspaceSettings}, from the same read: the
+ * cached tier of the settings row (see settings.helpers.ts). Copied alone, so
+ * a caller that wants one column does not pay to copy every parsed config.
+ *
+ * @internal
+ */
+export async function getWorkspaceSettingsRow(): Promise<SettingsRecord | null> {
+  const settings = await memoizePerRequest(CACHE_KEYS.WORKSPACE_SETTINGS, loadWorkspaceSettings)
+  const row = settings?.settings as SettingsRecord | undefined
+  return row ? structuredClone(row) : null
+}
+
+async function loadWorkspaceSettings(): Promise<WorkspaceSettings | null> {
+  const local = localCacheGet<WorkspaceSettings>(CACHE_KEYS.WORKSPACE_SETTINGS)
+  if (local) return local
+  const settings = await readWorkspaceSettings()
+  const ttlMs = settingsLocalTtlMs()
+  if (settings && ttlMs > 0) localCacheSet(CACHE_KEYS.WORKSPACE_SETTINGS, settings, ttlMs)
+  return settings
+}
+
+async function readWorkspaceSettings(): Promise<WorkspaceSettings | null> {
+  try {
+    const cached = await cacheGet<WorkspaceSettings>(CACHE_KEYS.WORKSPACE_SETTINGS)
+    if (cached) {
+      const rawSetup = (cached.settings as { setupState?: string | null } | undefined)?.setupState
+      // A request during provision can cache settings before bootstrap stamps
+      // setup_state. That row lives an hour. Trusting it keeps a finished
+      // workspace on the OSS wizard. An incomplete cache is the only hit we
+      // refuse: once setup is complete it is mutated through this service,
+      // which already busts the key.
+      if (isOnboardingComplete(getSetupState(rawSetup ?? null))) {
+        log.debug('workspace settings cache hit')
+        // The same repair resolveFeatureFlags applies. This path returns flags
+        // that were resolved when the entry was written, so an entry from
+        // before that rule existed still carries feedback:false and would keep
+        // the portal dark for the hour the entry has left to live.
+        if (cached.featureFlags) cached.featureFlags.feedback = true
+        return cached
+      }
+    }
+
+    const org = await db.query.settings.findFirst()
+    if (!org) return null
+
+    const authConfig = parseJsonConfig(org.authConfig, DEFAULT_AUTH_CONFIG)
+    const portalConfig = parsePortalConfig(org.portalConfig)
+    const brandingConfig = parseJsonOrNull<BrandingConfig>(org.brandingConfig) ?? {}
+    const developerConfig = parseJsonConfig(org.developerConfig, DEFAULT_DEVELOPER_CONFIG)
+
+    const widgetConfig = parseWidgetConfig(org.widgetConfig)
+    const assistantConfig = assistantConfigSchema.safeParse(org.assistantConfig)
+    const assistantIdentity = assistantConfig.success
+      ? assistantConfig.data.identity
+      : DEFAULT_ASSISTANT_CONFIG.identity
+    const helpCenterConfig = parseJsonConfig(org.helpCenterConfig, DEFAULT_HELP_CENTER_CONFIG)
+    const statusConfig = resolveStatusSettings(org.metadata)
+
+    const featureFlags = resolveFeatureFlags(org.featureFlags)
+
+    const [configuredTypes, passthroughKeys, verifiedDomains] = await Promise.all([
+      getConfiguredAuthTypes(),
+      getEmailDependentPassthroughKeys(),
+      listVerifiedDomains(),
+    ])
+    const filteredAuthOAuth = filterOAuthByCredentials(
+      authConfig.oauth,
+      configuredTypes,
+      passthroughKeys
+    )
+    // Public OIDC buttons come from the identity_provider table (portal
+    // surface only); the static map supplies social providers only.
+    const portalOidcProviders = await getPublicOidcProviders(org.authConfig)
+
+    const brandingData: SettingsBrandingData = {
+      name: org.name,
+      logoUrl: offHostPublicUrl(org.logoKey),
+      faviconUrl: getPublicUrlOrNull(org.faviconKey),
+      headerLogoUrl: getPublicUrlOrNull(org.headerLogoKey),
+      ogImageUrl: null,
+      headerDisplayMode: org.headerDisplayMode,
+      headerDisplayName: org.headerDisplayName,
+    }
+
+    const result: WorkspaceSettings = {
+      settings: org,
+      name: org.name,
+      slug: org.slug,
+      authConfig,
+      portalConfig,
+      brandingConfig,
+      developerConfig,
+      helpCenterConfig,
+      statusConfig,
+      customCss: org.customCss ?? '',
+      publicAuthConfig: {
+        oauth: filteredAuthOAuth,
+        openSignup: authConfig.openSignup,
+        twoFactor: { required: authConfig.twoFactor?.required ?? false },
+      },
+      publicPortalConfig: (() => {
+        const welcome = publicWelcomeCard(portalConfig.welcomeCard)
+        return {
+          openSignup: signupOpenFor({ authConfig, portalConfig }, 'portal'),
+          features: portalConfig.features,
+          ...(portalOidcProviders.length > 0 && { oidcProviders: portalOidcProviders }),
+          ...(welcome && { welcomeCard: welcome }),
+          portalAccess: {
+            isPrivate: portalConfig.access?.visibility === 'private',
+            widgetSignIn: portalConfig.access?.widgetSignIn ?? false,
+          },
+        }
+      })(),
+      publicWidgetConfig: projectPublicWidgetConfig(widgetConfig, featureFlags, assistantIdentity),
+      featureFlags,
+      brandingData,
+      faviconData: brandingData.faviconUrl ? { url: brandingData.faviconUrl } : null,
+      managedFieldPaths: org.managedFieldPaths ?? [],
+      state: (org.state as 'active' | 'suspended' | 'deleting' | null) ?? 'active',
+      verifiedDomains,
+    }
+
+    // 1h TTL: settings change rarely and every mutation in this file
+    // calls invalidateSettingsCache(), so a long TTL is safe and keeps
+    // the per-request cost of getWorkspaceSettings to a single Redis GET.
+    await cacheSet(CACHE_KEYS.WORKSPACE_SETTINGS, result, 3600)
+    return result
+  } catch (error) {
+    logSettingsReadError(log, error, 'get workspace settings failed')
+    wrapDbError('fetch settings with all configs', error)
+  }
+}
+
+// ============================================================================
+// Feature Flags
+// ============================================================================
+
+/**
+ * Get current feature flags, merged with defaults
+ */
+export async function getFeatureFlags(): Promise<FeatureFlags> {
+  const settings = await getWorkspaceSettings()
+  return settings?.featureFlags ?? DEFAULT_FEATURE_FLAGS
+}
+
+/**
+ * Check if a specific feature flag is enabled
+ */
+export async function isFeatureEnabled(flag: keyof FeatureFlags): Promise<boolean> {
+  const flags = await getFeatureFlags()
+  return flags[flag] ?? false
+}
+
+/**
+ * Whether the Copilot Q&A capability is enabled in the v3 assistant config.
+ * Reads the cached workspace settings (`getWorkspaceSettings`) — the same
+ * single-Redis-GET path `isFeatureEnabled` uses — so gating the copilot route
+ * on its hot path costs no extra DB round-trip; every config mutation calls
+ * `invalidateSettingsCache()`. Fails OPEN to the v3 default (on): a
+ * missing/invalid/unreadable config must not silently disable a working
+ * default, mirroring how the route already degrades.
+ */
+export async function isCopilotCapabilityEnabled(
+  capability: keyof AssistantCopilotCapabilities
+): Promise<boolean> {
+  const workspace = await getWorkspaceSettings()
+  const parsed = assistantConfigSchema.safeParse(workspace?.settings.assistantConfig)
+  const capabilities = parsed.success
+    ? parsed.data.agents.copilot.capabilities
+    : DEFAULT_ASSISTANT_CONFIG.agents.copilot.capabilities
+  return capabilities[capability]
+}
+
+/**
+ * Update feature flags (partial update, merges with existing)
+ */
+export async function updateFeatureFlags(
+  input: Partial<FeatureFlags>,
+  options: SettingsWriteOptions = {}
+): Promise<FeatureFlags> {
+  // The patch rewrites columns it was computed from (flags, metadata, widget
+  // and portal config), so the row is read under its lock: a concurrent write
+  // to any of them is read here rather than overwritten.
+  const write = async (tx: Database | Transaction) => {
+    const [org] = await tx.select().from(settings).limit(1).for('update')
+    if (!org) throw new NotFoundError('SETTINGS_NOT_FOUND', 'Settings not found')
+    const { updated, patch } = featureFlagsWrite(org, input)
+    await tx.update(settings).set(patch).where(eq(settings.id, org.id))
+    return updated
+  }
+  const flags = options.executor ? await write(options.executor) : await db.transaction(write)
+  if (!options.executor) await invalidateSettingsCache()
+  return flags
+}
+
+/**
+ * The settings columns one flag change writes. Exported so setup applies its
+ * goals through the same side effects as Settings > General: Status ON
+ * publishes the page, Support ON opens the Messenger and portal surfaces,
+ * Help center ON adds the Messenger help tab.
+ */
+export function featureFlagsWrite(
+  org: Pick<SettingsRecord, 'id' | 'featureFlags' | 'metadata' | 'widgetConfig' | 'portalConfig'>,
+  input: Partial<FeatureFlags>
+) {
+  // Unknown stored keys (retired Labs flags) drop here; the next write
+  // persists a clean shape.
+  const current = resolveFeatureFlags(org.featureFlags)
+  const updated = { ...current, ...input, feedback: true }
+  const turningSupportOn = current.supportInbox !== true && updated.supportInbox === true
+  const turningHelpOn = current.helpCenter !== true && updated.helpCenter === true
+  // General Status ON is the single publish control: clear a legacy
+  // unpublished bit so the page actually goes live. OFF only flips the flag;
+  // workspaces that stored statusPage:true with enabled:false stay unpublished
+  // until that toggle is flipped on. Written with the flags so a crash
+  // between the two cannot leave one side published and the other not.
+  const patch: {
+    featureFlags: string
+    metadata?: string
+    widgetConfig?: string
+    portalConfig?: string
+  } = {
+    featureFlags: JSON.stringify(updated),
+  }
+  if (input.statusPage === true) {
+    const existing = resolveStatusSettings(org.metadata)
+    const meta = parseMetadataBag(org.metadata, { settingsId: org.id, key: 'statusSettings' })
+    meta.statusSettings = { ...existing, enabled: true }
+    patch.metadata = JSON.stringify(meta)
+  }
+  if (turningSupportOn || turningHelpOn) {
+    let widget = parseWidgetConfig(org.widgetConfig)
+    if (turningSupportOn) widget = widgetActivationConfig(widget, 'messenger')
+    if (turningHelpOn) widget = { ...widget, tabs: { ...widget.tabs, help: true } }
+    patch.widgetConfig = JSON.stringify(widget)
+  }
+  if (turningSupportOn) {
+    const portal = parsePortalConfig(org.portalConfig)
+    patch.portalConfig = JSON.stringify({
+      ...portal,
+      support: { ...portal.support, enabled: true },
+    })
+  }
+  return { updated, patch }
+}

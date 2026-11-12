@@ -1,0 +1,253 @@
+/**
+ * OpenAPI Specification Generator
+ *
+ * Uses zod-openapi to generate OpenAPI 3.1 spec from Zod schemas.
+ * This package uses Zod v4's native .meta() method for OpenAPI metadata.
+ */
+
+import 'zod-openapi' // TypeScript type augmentation for .meta()
+import { createDocument, type ZodOpenApiPathsObject } from 'zod-openapi'
+import { z } from 'zod'
+
+// Re-export z for use in schema files
+export { z }
+
+// Store registered paths for the document
+const registeredPaths: ZodOpenApiPathsObject = {}
+
+/**
+ * Register an API path
+ */
+export function registerPath(path: string, methods: ZodOpenApiPathsObject[string]) {
+  registeredPaths[path] = { ...registeredPaths[path], ...methods }
+}
+
+/**
+ * Common schema components
+ */
+
+// TypeID pattern (e.g., post_01h455vb4pex5vsknk084sn02q)
+export const TypeIdSchema = z.string().meta({
+  description: 'TypeID - a type-prefixed UUID',
+  example: 'post_01h455vb4pex5vsknk084sn02q',
+})
+
+// Pagination parameters
+export const PaginationParamsSchema = z.object({
+  cursor: z.string().optional().meta({
+    description: 'Cursor for pagination',
+  }),
+  limit: z.coerce.number().min(1).max(100).default(20).meta({
+    description: 'Number of items per page (1-100)',
+    example: 20,
+  }),
+})
+
+// Pagination metadata in response
+export const PaginationMetaSchema = z.object({
+  cursor: z.string().nullable().optional().meta({
+    description: 'Cursor for next page, null if no more pages',
+  }),
+  hasMore: z.boolean().meta({
+    description: 'Whether there are more items',
+  }),
+  total: z.number().optional().meta({
+    description: 'Total count (when available)',
+  }),
+})
+
+// Standard error response
+export const ErrorResponseSchema = z.object({
+  error: z.object({
+    code: z.string().meta({
+      description: 'Error code',
+      example: 'NOT_FOUND',
+    }),
+    message: z.string().meta({
+      description: 'Human-readable error message',
+      example: 'Resource not found',
+    }),
+    details: z.record(z.string(), z.unknown()).optional().meta({
+      description: 'Additional error details',
+    }),
+  }),
+})
+
+/**
+ * Generate the complete OpenAPI specification
+ */
+export function generateOpenAPISpec(): ReturnType<typeof createDocument> {
+  return createDocument({
+    openapi: '3.1.0',
+    info: {
+      title: 'Quackback API',
+      version: '1.0.0',
+      description: `
+Quackback Public REST API for managing feedback, posts, boards, and more.
+
+## Authentication
+
+All API endpoints require authentication using an API key. Include your API key in the Authorization header:
+
+\`\`\`
+Authorization: Bearer qb_your_api_key_here
+\`\`\`
+
+There are two kinds of API key:
+
+- **Personal keys** act as the teammate who created them. A personal key can see and do only what its creator can, right now, narrowed by its scopes, and it stops working when its creator leaves the workspace. Teammates create them in their own account settings, under API keys.
+- **Workspace keys** belong to nobody. Each one holds its own workspace role, which sets what it can see and do, narrowed by its scopes, and it keeps working when people join or leave. Key managers create them under Settings > Developers.
+
+## Rate Limiting
+
+Requests are limited per client IP address. The default is 100 requests per minute, counted in a fixed one-minute window; some plans set a different limit. When the limit is exceeded the API responds with \`429\` and error code \`RATE_LIMITED\`, and the \`Retry-After\` header gives the number of seconds to wait before retrying.
+
+## Pagination
+
+List endpoints support cursor-based pagination:
+- Use the \`limit\` parameter to control page size (1-100, default 20)
+- Use the \`cursor\` parameter with the value from \`meta.pagination.cursor\` to fetch the next page
+- When \`meta.pagination.hasMore\` is false, there are no more items
+
+## TypeIDs
+
+All resource IDs use TypeID format: \`{type}_{base32_uuid}\`
+Example: \`post_01h455vb4pex5vsknk084sn02q\`
+`.trim(),
+      contact: {
+        name: 'Quackback Support',
+        url: 'https://github.com/quackback/quackback',
+      },
+      license: {
+        name: 'AGPL-3.0',
+        url: 'https://www.gnu.org/licenses/agpl-3.0.html',
+      },
+    },
+    servers: [
+      {
+        url: '/api/v1',
+        description: 'API v1',
+      },
+    ],
+    security: [{ bearerAuth: [] }],
+    tags: [
+      { name: 'Posts', description: 'Manage feedback posts' },
+      { name: 'Boards', description: 'Manage feedback boards' },
+      { name: 'Comments', description: 'Manage post comments' },
+      { name: 'Votes', description: 'Manage post votes' },
+      { name: 'Tags', description: 'Manage tags' },
+      { name: 'Statuses', description: 'Manage post statuses' },
+      { name: 'Members', description: 'Manage workspace team members (served at /principals)' },
+      { name: 'Webhooks', description: 'Manage webhook endpoints and signing secrets' },
+      { name: 'Help Center', description: 'Manage help center categories and articles' },
+      { name: 'Segments', description: 'Manage segment membership' },
+      { name: 'Apps', description: 'Endpoints for apps embedded in external help desks' },
+      {
+        name: 'Workspace',
+        description: 'Mention lookups and usage counters, authenticated without an API key',
+      },
+      {
+        name: 'Settings',
+        description: 'Read and change workspace settings by area, with revisions and undo',
+      },
+      { name: 'Roadmaps', description: 'Manage roadmaps' },
+      { name: 'Changelog', description: 'Manage changelog entries' },
+      { name: 'Conversations', description: 'Manage support conversations' },
+      { name: 'Tickets', description: 'Manage support tickets' },
+      { name: 'Files', description: 'Upload files to attach to conversations and tickets' },
+      { name: 'Moderation', description: 'Review and moderate pending posts and comments' },
+      {
+        name: 'Status',
+        description: 'Manage the status page: components, incidents, and maintenance',
+      },
+    ],
+    paths: registeredPaths,
+    components: {
+      securitySchemes: {
+        bearerAuth: {
+          type: 'http',
+          scheme: 'bearer',
+          bearerFormat: 'API Key',
+          description:
+            'API key authentication. Format: Bearer qb_xxx. A personal key acts as its creator; a workspace key holds its own role.',
+        },
+        sessionCookie: {
+          type: 'apiKey',
+          in: 'cookie',
+          name: '__Secure-better-auth.session_token',
+          description:
+            'Signed-in browser session on an HTTPS deployment. Used by the mention lookup endpoints.',
+        },
+        sessionCookieHttp: {
+          type: 'apiKey',
+          in: 'cookie',
+          name: 'better-auth.session_token',
+          description:
+            'Signed-in browser session on a plain HTTP deployment, such as local development.',
+        },
+        adminToken: {
+          type: 'http',
+          scheme: 'bearer',
+          description: 'Operator token from the ADMIN_API_TOKEN environment variable.',
+        },
+        setupToken: {
+          type: 'http',
+          scheme: 'bearer',
+          description:
+            'First-run setup token: the SETUP_TOKEN environment variable, or the token the server logs once on first boot. Valid only while the workspace has no admin.',
+        },
+      },
+    },
+  })
+}
+
+/**
+ * Helper to create a paginated response schema
+ */
+export function createPaginatedResponseSchema<T extends z.ZodTypeAny>(
+  itemSchema: T,
+  description: string
+) {
+  return z
+    .object({
+      data: z.array(itemSchema),
+      meta: z
+        .object({
+          pagination: PaginationMetaSchema,
+        })
+        .optional(),
+    })
+    .meta({ description })
+}
+
+/**
+ * Helper to create a single item response schema
+ */
+export function createItemResponseSchema<T extends z.ZodTypeAny>(
+  itemSchema: T,
+  description: string
+) {
+  return z
+    .object({
+      data: itemSchema,
+    })
+    .meta({ description })
+}
+
+/**
+ * Helper to create a request body schema with proper typing for zod-openapi
+ */
+export function createRequestBodySchema<T extends z.ZodRawShape>(shape: T, description?: string) {
+  const schema = z.object(shape)
+  return description ? schema.meta({ description }) : schema.meta({})
+}
+
+/**
+ * Type helper to ensure Zod schemas are compatible with zod-openapi's expected types.
+ * This works around a type inference issue between Zod v4 and zod-openapi v5
+ * where different package versions cause nominal type mismatches.
+ */
+// oxlint-disable-next-line @typescript-eslint/no-explicit-any
+export function asSchema<T extends z.ZodTypeAny>(schema: T): any {
+  return schema
+}

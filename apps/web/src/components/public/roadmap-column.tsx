@@ -1,0 +1,120 @@
+import { ArrowPathIcon } from '@heroicons/react/24/solid'
+import { useIntl } from 'react-intl'
+import { useInfiniteScroll } from '@/lib/client/hooks/use-infinite-scroll'
+import { RoadmapCard } from './roadmap-card'
+import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
+import {
+  usePublicRoadmapPosts,
+  flattenRoadmapViewPosts,
+} from '@/lib/client/hooks/use-roadmap-posts-query'
+import type { RoadmapId, PostStatusId } from '@quackback/ids'
+import type { RoadmapFilters } from '@/lib/shared/types'
+
+interface RoadmapColumnProps {
+  roadmapId: RoadmapId
+  statusId?: PostStatusId
+  bucketId?: string
+  title: string
+  icon?: string | null
+  color: string
+  filters?: RoadmapFilters
+}
+
+export function RoadmapColumn({
+  roadmapId,
+  statusId,
+  bucketId,
+  title,
+  icon,
+  color,
+  filters,
+}: RoadmapColumnProps) {
+  const intl = useIntl()
+  const { data, isFetchingNextPage, hasNextPage, fetchNextPage, isLoading } = usePublicRoadmapPosts(
+    {
+      roadmapId,
+      statusId,
+      bucketId,
+      filters,
+    }
+  )
+
+  const posts = flattenRoadmapViewPosts(data)
+  const total = data?.pages[0]?.total ?? 0
+
+  const sentinelRef = useInfiniteScroll({
+    hasMore: hasNextPage,
+    isFetching: isFetchingNextPage,
+    onLoadMore: fetchNextPage,
+  })
+
+  return (
+    <Card className="flex-1 min-w-[300px] max-w-[350px] flex flex-col h-full">
+      <CardHeader className="pb-3 shrink-0">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="h-3 w-3 rounded-full" style={{ backgroundColor: color }} />
+            <CardTitle className="text-base">
+              {icon && (
+                <span className="me-1.5" aria-hidden>
+                  {icon}
+                </span>
+              )}
+              {title}
+            </CardTitle>
+          </div>
+          <Badge variant="secondary" className="text-xs">
+            {total}
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="flex-1 min-h-0 p-0">
+        <ScrollArea className="h-full px-6 pb-6">
+          {isLoading ? (
+            <div className="h-full flex items-center justify-center py-8 animate-in fade-in duration-200">
+              <ArrowPathIcon className="h-5 w-5 animate-spin text-muted-foreground" />
+            </div>
+          ) : posts.length === 0 ? (
+            <div className="h-full flex items-center justify-center py-8 animate-in fade-in duration-200">
+              <p className="text-sm text-muted-foreground">
+                {intl.formatMessage({
+                  id: 'portal.roadmap.column.empty',
+                  defaultMessage: 'No items yet',
+                })}
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {posts.map((post, index) => (
+                <div
+                  key={post.id}
+                  className="animate-in fade-in duration-200 fill-mode-backwards"
+                  style={{ animationDelay: `${Math.min(index * 30, 150)}ms` }}
+                >
+                  <RoadmapCard
+                    id={post.id}
+                    title={post.title}
+                    voteCount={post.voteCount}
+                    commentCount={post.commentCount}
+                    board={{ slug: post.board.slug, name: post.board.name }}
+                    eta={post.eta}
+                  />
+                </div>
+              ))}
+              {hasNextPage && (
+                <div ref={sentinelRef} className="py-2 flex justify-center">
+                  {isFetchingNextPage && (
+                    <ArrowPathIcon className="h-4 w-4 animate-spin text-muted-foreground" />
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+          <ScrollBar />
+        </ScrollArea>
+      </CardContent>
+    </Card>
+  )
+}

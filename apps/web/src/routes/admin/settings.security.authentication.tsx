@@ -1,0 +1,94 @@
+import { createFileRoute } from '@tanstack/react-router'
+import { PERMISSIONS } from '@/lib/shared/permissions'
+import { assertRoutePermission } from '@/lib/shared/route-permission'
+import { useSuspenseQuery } from '@tanstack/react-query'
+import { z } from 'zod'
+import { settingsQueries } from '@/lib/client/queries/settings'
+import { adminQueries } from '@/lib/client/queries/admin'
+import { SettingsPage } from '@/components/admin/settings/settings-page'
+import { AuthSettings, type AuthTab } from '@/components/admin/settings/security/auth-settings'
+import { readBatch } from '@/lib/client/queries/read-batch'
+import { warmQuery } from '@/lib/client/queries/warm-query'
+import { adminPageHead } from '@/lib/client/admin-head'
+
+const searchSchema = z.object({
+  // The Access & Security page splits by CONCERN, not by surface:
+  //   - portal-access: who can view the portal (visibility, domains,
+  //                    invites, segments, widget sign-in)
+  //   - sign-in:       authentication methods for both surfaces in one
+  //                    place (password + 2FA, magic link, social, OIDC)
+  //                    with per-surface toggles inline.
+  //   - audit-log:     admin action history (merged from the retired
+  //                    standalone route).
+  //
+  // Backward compat: the old `team-access` tab is coerced to `sign-in`
+  // so stale bookmarks don't crash.
+  tab: z.preprocess(
+    (v) => (v === 'team-access' ? 'sign-in' : v),
+    z.enum(['portal-access', 'sign-in', 'audit-log']).optional()
+  ),
+})
+
+export const Route = createFileRoute('/admin/settings/security/authentication')({
+  head: adminPageHead('Authentication settings'),
+  validateSearch: searchSchema,
+  loader: async ({ context, location }) => {
+    assertRoutePermission(context.permissions, PERMISSIONS.AUTH_MANAGE)
+
+    const { queryClient } = context
+    // The portal access tab (the default) lists the segments a private portal
+    // can admit, read under segment.view.
+    const tab = (location.search as { tab?: unknown }).tab ?? 'portal-access'
+    const warmSegments =
+      tab === 'portal-access' && !!context.permissions?.includes(PERMISSIONS.SEGMENT_VIEW)
+    // Auth + SSO reads are cheap and never 402. The audit feed is an Enterprise
+    // entitlement: prefetching it here took down Portal access and Sign-in
+    // on every other plan. The audit tab loads that query only when entitled.
+    const { listEntitlementsFn } = await import('@/lib/server/functions/entitlement-status')
+    const { ensureBillingCatalogue } = await import('@/lib/client/queries/billing')
+    const ensure = readBatch(queryClient)
+    const [, entitlements] = await Promise.all([
+      Promise.all([
+        ensure(settingsQueries.authConfig()),
+        ensure(settingsQueries.verifiedDomains()),
+        ensure(settingsQueries.portalConfig()),
+        ensure(adminQueries.authProviderStatus()),
+        ensure(settingsQueries.identityProviders()),
+        ensure(adminQueries.recoveryCodes()),
+        warmSegments ? warmQuery(ensure, adminQueries.segments()) : undefined,
+      ]),
+      listEntitlementsFn(),
+      ensureBillingCatalogue(queryClient, context.billingEnabled),
+    ])
+
+    return { ssoEntitled: entitlements.sso, auditEntitled: entitlements.auditLog }
+  },
+  component: AuthenticationPage,
+})
+
+function AuthenticationPage() {
+  const search = Route.useSearch()
+  const tab: AuthTab = search.tab ?? 'portal-access'
+
+  const authConfigQuery = useSuspenseQuery(settingsQueries.authConfig())
+  const portalConfigQuery = useSuspenseQuery(settingsQueries.portalConfig())
+  const credentialStatusQuery = useSuspenseQuery(adminQueries.authProviderStatus())
+
+  const { ssoEntitled, auditEntitled } = Route.useLoaderData()
+
+  return (
+    <SettingsPage
+      page="/admin/settings/security/authentication"
+      width={tab === 'audit-log' ? 'wide' : 'form'}
+    >
+      <AuthSettings
+        tab={tab}
+        teamAuthConfig={authConfigQuery.data}
+        portalConfig={portalConfigQuery.data}
+        credentialStatus={credentialStatusQuery.data}
+        customOidcProviderTier={ssoEntitled}
+        auditEntitled={auditEntitled}
+      />
+    </SettingsPage>
+  )
+}

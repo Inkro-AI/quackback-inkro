@@ -1,0 +1,313 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { PostId, PrincipalId, PostStatusId, PostTagId } from '@quackback/ids'
+
+const createActivity = vi.fn()
+const dispatchPostStatusChanged = vi.fn()
+const dispatchPostOwnerAssigned = vi.fn()
+const buildEventActor = vi.fn((actor) => actor)
+
+const mockPostsFindFirst = vi.fn()
+const mockBoardsFindFirst = vi.fn()
+const mockPostStatusesFindFirst = vi.fn()
+const mockPrincipalFindFirst = vi.fn()
+
+const selectWhere = vi.fn()
+const selectFrom = vi.fn(() => ({ where: selectWhere }))
+const dbSelect = vi.fn(() => ({ from: selectFrom }))
+
+const updateReturning = vi.fn()
+const updateWhere = vi.fn(() => ({ returning: updateReturning }))
+const updateSet = vi.fn(() => ({ where: updateWhere }))
+const dbUpdate = vi.fn(() => ({ set: updateSet }))
+
+const deleteWhere = vi.fn()
+const dbDelete = vi.fn(() => ({ where: deleteWhere }))
+
+const insertValues = vi.fn()
+const dbInsert = vi.fn(() => ({ values: insertValues }))
+
+vi.mock('@/lib/server/db', async (importOriginal) => {
+  const { sql: realSql } = await vi.importActual<typeof import('drizzle-orm')>('drizzle-orm')
+
+  // Spread the real db module so tables/operators stay current; override only what this suite drives.
+  return {
+    ...(await importOriginal<typeof import('@/lib/server/db')>()),
+    db: {
+      query: {
+        posts: { findFirst: (...args: unknown[]) => mockPostsFindFirst(...args) },
+        boards: { findFirst: (...args: unknown[]) => mockBoardsFindFirst(...args) },
+        postStatuses: { findFirst: (...args: unknown[]) => mockPostStatusesFindFirst(...args) },
+        principal: { findFirst: (...args: unknown[]) => mockPrincipalFindFirst(...args) },
+      },
+      select: dbSelect,
+      update: dbUpdate,
+      delete: dbDelete,
+      insert: dbInsert,
+    },
+    eq: vi.fn(),
+    inArray: vi.fn(),
+    sql: realSql,
+  }
+})
+
+vi.mock('@/lib/server/events/dispatch', () => ({
+  dispatchPostCreated: vi.fn(),
+  dispatchPostStatusChanged,
+  dispatchPostUpdated: vi.fn(),
+  dispatchPostOwnerAssigned,
+  buildEventActor,
+}))
+
+vi.mock('@/lib/server/domains/subscriptions/subscription.service', () => ({
+  subscribeToPost: vi.fn(),
+}))
+
+vi.mock('@/lib/server/domains/activity/activity.service', () => ({
+  createActivity,
+}))
+
+describe('post.service updatePost', () => {
+  beforeEach(() => {
+    createActivity.mockClear()
+    dispatchPostStatusChanged.mockClear()
+    dispatchPostOwnerAssigned.mockClear()
+    buildEventActor.mockClear()
+    mockPostsFindFirst.mockReset()
+    mockBoardsFindFirst.mockReset()
+    mockPostStatusesFindFirst.mockReset()
+    mockPrincipalFindFirst.mockReset()
+    selectWhere.mockReset()
+    updateReturning.mockReset()
+    deleteWhere.mockReset()
+    insertValues.mockReset()
+
+    mockPostsFindFirst.mockResolvedValue({
+      id: 'post_123' as PostId,
+      title: 'Original title',
+      content: 'Original content',
+      contentJson: null,
+      boardId: 'board_123',
+      statusId: 'post_status_open',
+      ownerPrincipalId: 'principal_prev',
+      updatedAt: new Date(),
+    })
+    mockBoardsFindFirst.mockResolvedValue({
+      id: 'board_123',
+      slug: 'feedback',
+    })
+    mockPostStatusesFindFirst
+      .mockResolvedValueOnce({
+        id: 'post_status_open',
+        name: 'Open',
+        color: '#888888',
+      })
+      .mockResolvedValueOnce({
+        id: 'post_status_closed',
+        name: 'Closed',
+        color: '#111111',
+      })
+    selectWhere.mockResolvedValueOnce([{ tagId: 'tag_old' as PostTagId }]).mockResolvedValueOnce([
+      { id: 'tag_old' as PostTagId, name: 'Old tag' },
+      { id: 'tag_new' as PostTagId, name: 'New tag' },
+    ])
+    updateReturning.mockResolvedValue([
+      {
+        id: 'post_123' as PostId,
+        title: 'Original title',
+        content: 'Original content',
+        contentJson: null,
+        boardId: 'board_123',
+        statusId: 'post_status_closed' as PostStatusId,
+        ownerPrincipalId: 'principal_next' as PrincipalId,
+        updatedAt: new Date(),
+      },
+    ])
+    mockPrincipalFindFirst
+      .mockResolvedValueOnce({ displayName: 'Next Owner' })
+      .mockResolvedValueOnce({ displayName: 'Previous Owner' })
+  })
+
+  it('requires an actor for post updates', async () => {
+    const { updatePost } = await import('../post.service')
+
+    await expect(
+      updatePost('post_123' as PostId, { title: 'Updated title' }, undefined as never)
+    ).rejects.toThrow('Actor principal ID is required')
+  })
+
+  it('maps pinned=true to pinned_at and pinned=false to null', async () => {
+    const { updatePost } = await import('../post.service')
+
+    await updatePost(
+      'post_123' as PostId,
+      { pinned: true },
+      { principalId: 'principal_actor' as PrincipalId }
+    )
+    expect(updateSet).toHaveBeenCalledWith(expect.objectContaining({ pinnedAt: expect.any(Date) }))
+
+    updateSet.mockClear()
+    await updatePost(
+      'post_123' as PostId,
+      { pinned: false },
+      { principalId: 'principal_actor' as PrincipalId }
+    )
+    expect(updateSet).toHaveBeenCalledWith(expect.objectContaining({ pinnedAt: null }))
+  })
+
+  it('records status, owner, and tag activity for API-style updates', async () => {
+    const { updatePost } = await import('../post.service')
+
+    await updatePost(
+      'post_123' as PostId,
+      {
+        statusId: 'post_status_closed' as PostStatusId,
+        ownerPrincipalId: 'principal_next' as PrincipalId,
+        tagIds: ['tag_new' as PostTagId],
+      },
+      {
+        principalId: 'principal_actor' as PrincipalId,
+      }
+    )
+
+    expect(buildEventActor).toHaveBeenCalledWith({ principalId: 'principal_actor' })
+    expect(dispatchPostStatusChanged).toHaveBeenCalledTimes(1)
+    expect(createActivity).toHaveBeenCalledWith(
+      expect.objectContaining({
+        principalId: 'principal_actor',
+        type: 'status.changed',
+        metadata: expect.objectContaining({
+          fromName: 'Open',
+          toName: 'Closed',
+        }),
+      })
+    )
+    expect(createActivity).toHaveBeenCalledWith(
+      expect.objectContaining({
+        principalId: 'principal_actor',
+        type: 'owner.assigned',
+        metadata: expect.objectContaining({
+          ownerName: 'Next Owner',
+          previousOwnerName: 'Previous Owner',
+        }),
+      })
+    )
+    expect(dispatchPostOwnerAssigned).toHaveBeenCalledTimes(1)
+    expect(dispatchPostOwnerAssigned).toHaveBeenCalledWith(
+      { principalId: 'principal_actor' },
+      expect.objectContaining({
+        postId: 'post_123',
+        postTitle: 'Original title',
+        boardSlug: 'feedback',
+        ownerPrincipalId: 'principal_next',
+        previousOwnerPrincipalId: 'principal_prev',
+      })
+    )
+    expect(createActivity).toHaveBeenCalledWith(
+      expect.objectContaining({
+        principalId: 'principal_actor',
+        type: 'tags.added',
+        metadata: { tagNames: ['New tag'] },
+      })
+    )
+    expect(createActivity).toHaveBeenCalledWith(
+      expect.objectContaining({
+        principalId: 'principal_actor',
+        type: 'tags.removed',
+        metadata: { tagNames: ['Old tag'] },
+      })
+    )
+  })
+
+  it('emits the owner event when a teammate assigns a post to themselves', async () => {
+    mockPostsFindFirst.mockResolvedValueOnce({
+      id: 'post_123' as PostId,
+      title: 'Original title',
+      content: 'Original content',
+      contentJson: null,
+      boardId: 'board_123',
+      statusId: 'post_status_open',
+      ownerPrincipalId: null,
+      updatedAt: new Date(),
+    })
+    updateReturning.mockResolvedValueOnce([
+      {
+        id: 'post_123' as PostId,
+        title: 'Original title',
+        content: 'Original content',
+        contentJson: null,
+        boardId: 'board_123',
+        statusId: 'post_status_open',
+        ownerPrincipalId: 'principal_actor' as PrincipalId,
+        updatedAt: new Date(),
+      },
+    ])
+
+    const { updatePost } = await import('../post.service')
+
+    await updatePost(
+      'post_123' as PostId,
+      { ownerPrincipalId: 'principal_actor' as PrincipalId },
+      { principalId: 'principal_actor' as PrincipalId }
+    )
+
+    expect(createActivity).toHaveBeenCalledWith(expect.objectContaining({ type: 'owner.assigned' }))
+    expect(dispatchPostOwnerAssigned).toHaveBeenCalledTimes(1)
+    expect(dispatchPostOwnerAssigned).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ ownerPrincipalId: 'principal_actor' })
+    )
+  })
+
+  it('writes the eta when set', async () => {
+    const { updatePost } = await import('../post.service')
+    const eta = new Date('2027-03-01T00:00:00.000Z')
+
+    await updatePost(
+      'post_123' as PostId,
+      { eta },
+      { principalId: 'principal_actor' as PrincipalId }
+    )
+
+    expect(updateSet).toHaveBeenCalledWith(expect.objectContaining({ eta }))
+  })
+
+  it('truncates a mid-month eta to the first of its UTC month', async () => {
+    const { updatePost } = await import('../post.service')
+
+    await updatePost(
+      'post_123' as PostId,
+      { eta: new Date('2027-03-18T14:37:12.000Z') },
+      { principalId: 'principal_actor' as PrincipalId }
+    )
+
+    expect(updateSet).toHaveBeenCalledWith(
+      expect.objectContaining({ eta: new Date('2027-03-01T00:00:00.000Z') })
+    )
+  })
+
+  it('clears the eta when passed null', async () => {
+    const { updatePost } = await import('../post.service')
+
+    await updatePost(
+      'post_123' as PostId,
+      { eta: null },
+      { principalId: 'principal_actor' as PrincipalId }
+    )
+
+    expect(updateSet).toHaveBeenCalledWith(expect.objectContaining({ eta: null }))
+  })
+
+  it('leaves the eta untouched when the field is omitted', async () => {
+    const { updatePost } = await import('../post.service')
+    updateSet.mockClear()
+
+    await updatePost(
+      'post_123' as PostId,
+      { title: 'Updated title' },
+      { principalId: 'principal_actor' as PrincipalId }
+    )
+
+    // The UPDATE set never carries an eta key when eta is not in the input.
+    expect(updateSet).toHaveBeenCalledWith(expect.not.objectContaining({ eta: expect.anything() }))
+  })
+})

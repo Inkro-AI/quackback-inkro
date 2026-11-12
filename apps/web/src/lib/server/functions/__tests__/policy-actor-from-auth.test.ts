@@ -1,0 +1,205 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import type { Actor } from '@/lib/server/policy/types'
+import type { AuthContext } from '../auth-helpers'
+import type { PrincipalId, SegmentId, UserId, WorkspaceId } from '@quackback/ids'
+import { PERMISSIONS, type PermissionKey } from '@/lib/shared/permissions'
+
+vi.mock('@/lib/server/domains/segments/segment-membership.service', () => ({
+  segmentIdsForPrincipal: vi.fn(async (principalId: string | null) =>
+    principalId === null ? new Set() : new Set(['segment_a', 'segment_b'])
+  ),
+}))
+
+const mockResolveTestFeedbackActor = vi.hoisted(() =>
+  vi.fn(async (actor: Actor): Promise<Actor> => {
+    expect(actor.principalType).toBe('anonymous')
+    expect(actor.principalId).not.toBeNull()
+    expect(actor.permissions).toBeInstanceOf(Set)
+    expect(actor.segmentIds).toBeInstanceOf(Set)
+    if (actor.principalId === 'principal_test_feedback') {
+      return {
+        ...actor,
+        testFeedback: {
+          ownerPrincipalId: 'principal_test_owner' as PrincipalId,
+          active: true,
+          canView: true,
+          canSubmit: true,
+        },
+      }
+    }
+    return actor
+  })
+)
+vi.mock('@/lib/server/test-customer-feedback', () => ({
+  resolveTestFeedbackActor: mockResolveTestFeedbackActor,
+}))
+beforeEach(() => {
+  mockResolveTestFeedbackActor.mockClear()
+})
+
+import { policyActorFromAuth, normalizePrincipalType } from '../auth-helpers'
+
+describe('normalizePrincipalType', () => {
+  it('preserves support and does not collapse it to user', () => {
+    expect(normalizePrincipalType('support')).toBe('support')
+    expect(normalizePrincipalType('user')).toBe('user')
+    expect(normalizePrincipalType('anonymous')).toBe('anonymous')
+    expect(normalizePrincipalType('service')).toBe('service')
+    expect(normalizePrincipalType('future_kind')).toBe('user')
+    expect(normalizePrincipalType(null)).toBe('user')
+  })
+})
+
+// Build a fully-typed AuthContext (no `as never`/`as unknown` casts).
+// principal.role is constrained to {admin, member, user} — service is a
+// principal *type*, not a role.
+function buildAuth(overrides: {
+  principalId?: string
+  principalRole?: 'admin' | 'member' | 'user'
+  principalType?: string
+  userEmail?: string
+  permissions?: PermissionKey[]
+}): AuthContext {
+  return {
+    settings: {
+      id: 'workspace_main' as WorkspaceId,
+      slug: 'main',
+      name: 'Main',
+      logoKey: null,
+    },
+    user: {
+      id: 'user_test' as UserId,
+      email: overrides.userEmail ?? 'test@x.com',
+      name: 'Test',
+      image: null,
+    },
+    principal: {
+      id: (overrides.principalId ?? 'principal_test') as PrincipalId,
+      role: overrides.principalRole ?? 'user',
+      type: overrides.principalType ?? 'user',
+    },
+    permissions: overrides.permissions ?? [],
+    scope: 'dashboard',
+  }
+}
+
+describe('policyActorFromAuth', () => {
+  it('returns ANONYMOUS_ACTOR for null auth', async () => {
+    const actor = await policyActorFromAuth(null)
+    expect(actor.role).toBeNull()
+    expect(actor.principalType).toBe('anonymous')
+    expect(actor.principalId).toBeNull()
+    expect(actor.segmentIds.size).toBe(0)
+  })
+
+  it('maps role and resolves segments for a portal user', async () => {
+    const actor = await policyActorFromAuth(buildAuth({ principalRole: 'user' }))
+    expect(actor.principalType).toBe('user')
+    expect(actor.role).toBe('user')
+    expect(actor.segmentIds.size).toBe(2)
+    expect(actor.segmentIds.has('segment_a' as SegmentId)).toBe(true)
+  })
+
+  it('preserves principalType=anonymous (Better Auth anon session)', async () => {
+    // Critical regression guard — codex P1. Anonymous sessions must NOT
+    // satisfy audience.kind='authenticated' or bypass requireApproval='anonymous'.
+    const actor = await policyActorFromAuth(buildAuth({ principalType: 'anonymous' }))
+    expect(actor.principalType).toBe('anonymous')
+  })
+
+  it('passes the complete anonymous actor through the feedback resolver without changing identity', async () => {
+    const actor = await policyActorFromAuth(
+      buildAuth({
+        principalId: 'principal_test_feedback',
+        principalType: 'anonymous',
+        permissions: [PERMISSIONS.POST_CREATE],
+      })
+    )
+    expect(mockResolveTestFeedbackActor).toHaveBeenCalledExactlyOnceWith({
+      principalId: 'principal_test_feedback',
+      role: 'user',
+      principalType: 'anonymous',
+      segmentIds: new Set(['segment_a', 'segment_b']),
+      permissions: new Set([PERMISSIONS.POST_CREATE]),
+    })
+    expect(actor.principalId).toBe('principal_test_feedback')
+    expect(actor.principalType).toBe('anonymous')
+    expect(actor.permissions).toEqual(new Set([PERMISSIONS.POST_CREATE]))
+    expect(actor.testFeedback).toEqual({
+      ownerPrincipalId: 'principal_test_owner',
+      active: true,
+      canView: true,
+      canSubmit: true,
+    })
+  })
+
+  it('preserves principalType=service for API-key principals', async () => {
+    // Service principals have a regular role (member/admin/user) plus a
+    // distinct principalType='service'. The two are independent — role
+    // drives team-vs-portal checks, type drives audience checks.
+    const actor = await policyActorFromAuth(
+      buildAuth({ principalType: 'service', principalRole: 'member' })
+    )
+    expect(actor.principalType).toBe('service')
+    expect(actor.role).toBe('member')
+  })
+
+  it('preserves principalType=support for Cloud support admins', async () => {
+    // Collapsing this onto 'user' would make isIdentifiedHuman true and put
+    // the operator on people lists. Role stays admin so isTeamActor still admits /admin.
+    const actor = await policyActorFromAuth(
+      buildAuth({ principalType: 'support', principalRole: 'admin' })
+    )
+    expect(actor.principalType).toBe('support')
+    expect(actor.role).toBe('admin')
+  })
+
+  it('maps admin role through verbatim', async () => {
+    const actor = await policyActorFromAuth(buildAuth({ principalRole: 'admin' }))
+    expect(actor.role).toBe('admin')
+  })
+
+  it('maps member role through verbatim', async () => {
+    const actor = await policyActorFromAuth(buildAuth({ principalRole: 'member' }))
+    expect(actor.role).toBe('member')
+  })
+
+  it('treats unknown principalType as "user" (safe default)', async () => {
+    // Forward-compat: if a future principal type is introduced that
+    // policyActorFromAuth hasn't been updated to handle, default to the
+    // most restrictive interpretation ('user', not 'service'). 'user' is
+    // a signed-in real person — denying them is a UX bug, but treating
+    // them as a service would weaken the security model.
+    const actor = await policyActorFromAuth(buildAuth({ principalType: 'future_kind' }))
+    expect(actor.principalType).toBe('user')
+  })
+
+  it('threads the principalId into the segment lookup', async () => {
+    const actor = await policyActorFromAuth(buildAuth({ principalId: 'principal_specific' }))
+    expect(actor.principalId).toBe('principal_specific')
+    // The segment lookup ran for this specific id (mocked to return 2 segments).
+    expect(actor.segmentIds.size).toBe(2)
+  })
+
+  it('preserves custom permissions supplied by auth instead of expanding the legacy role', async () => {
+    const actor = await policyActorFromAuth(
+      buildAuth({ principalRole: 'member', permissions: [PERMISSIONS.BILLING_MANAGE] })
+    )
+
+    expect(actor.permissions).toEqual(new Set([PERMISSIONS.BILLING_MANAGE]))
+    expect(actor.permissions?.has(PERMISSIONS.CONVERSATION_VIEW)).toBe(false)
+  })
+
+  it('preserves an explicitly empty assigned-role permission set', async () => {
+    const actor = await policyActorFromAuth(buildAuth({ principalRole: 'admin', permissions: [] }))
+
+    expect(actor.permissions).toEqual(new Set())
+  })
+
+  it('returns an immutable Set (callers cannot mutate)', async () => {
+    const actor = await policyActorFromAuth(buildAuth({}))
+    // ReadonlySet at the type level; runtime is still a Set, but if any
+    // production code somewhere mutates it, that's a bug we want to catch.
+    expect(actor.segmentIds instanceof Set).toBe(true)
+  })
+})

@@ -1,0 +1,347 @@
+/**
+ * MCP HTTP Request Handler
+ *
+ * Supports dual authentication:
+ * 1. OAuth access token (JWT verified via JWKS, no DB round-trip)
+ * 2. API key (from CI/programmatic use with qb_xxx tokens)
+ *
+ * When neither auth method succeeds, returns 401 with WWW-Authenticate
+ * header pointing to the protected resource metadata, which triggers
+ * the MCP SDK's OAuth discovery flow.
+ */
+
+import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
+import type { Role } from '@/lib/shared/roles'
+import { requestToResourceInput, verifyAccessTokenRequest } from 'better-auth/oauth2'
+import { withApiKeyAuth } from '@/lib/server/domains/api/auth'
+import {
+  API_KEY_SCOPES,
+  effectiveScopes,
+  hasApiScope,
+} from '@/lib/server/domains/api-keys/api-key-scopes'
+import {
+  insufficientScopeChallenge,
+  unauthenticatedMcpChallenge,
+  unauthenticatedMcpResponse,
+} from './oauth-challenge'
+import { requiredScopesForMcpRpc } from './required-scope'
+import { DomainException, RateLimitError } from '@/lib/shared/errors'
+import { EntitlementRequiredError } from '@/lib/server/errors/entitlement-error'
+import { getDeveloperConfig } from '@/lib/server/domains/settings/settings.service'
+import { permissionsForPrincipal } from '@/lib/server/policy/permissions'
+import type { PermissionKey } from '@/lib/shared/permissions'
+import { config } from '@/lib/server/config'
+import {
+  apiKeyAttribution,
+  MCP_ATTRIBUTION,
+  oauthClientAttribution,
+  runWithAuditAttribution,
+  setAuditAttribution,
+} from '@/lib/server/audit/attribution'
+import { createMcpServer } from './server'
+import { readOAuthPrincipal } from './oauth-principal'
+import type { PrincipalId } from '@quackback/ids'
+import type { McpAuthContext, McpScope } from './types'
+
+/** Build a JSON-RPC error response (used for MCP-level denials). */
+function jsonRpcError(status: number, message: string): Response {
+  return new Response(
+    JSON.stringify({
+      jsonrpc: '2.0',
+      error: { code: -32001, message },
+      id: null,
+    }),
+    { status, headers: { 'Content-Type': 'application/json' } }
+  )
+}
+
+/**
+ * A refusal the caller can act on: the JSON-RPC error envelope every MCP client
+ * already understands, at HTTP 402, carrying the plan that would grant the
+ * server in `data` so a client can show the upgrade prompt rather than a bare
+ * "denied".
+ */
+function jsonRpcEntitlementError(error: EntitlementRequiredError): Response {
+  return new Response(
+    JSON.stringify({
+      jsonrpc: '2.0',
+      error: { code: -32001, message: error.message, data: error.toResponseBody() },
+      id: null,
+    }),
+    { status: error.statusCode, headers: { 'Content-Type': 'application/json' } }
+  )
+}
+
+export const ALL_SCOPES: McpScope[] = [...API_KEY_SCOPES]
+
+const API_KEY_PREFIX = 'qb_'
+
+/** Extract Bearer token from Authorization header, or null. */
+function extractBearerToken(request: Request): string | null {
+  const header = request.headers.get('authorization')
+  return header?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null
+}
+
+/**
+ * Resolve auth from OAuth JWT access token.
+ * Verifies the token signature via JWKS, then re-reads the principal's
+ * current role from the database so that role changes (demotions, etc.)
+ * take effect immediately rather than at token expiry.
+ * Returns McpAuthContext if valid, null if not an OAuth token or verification fails.
+ */
+async function resolveOAuthContext(
+  request: Request,
+  token: string
+): Promise<McpAuthContext | null> {
+  if (token.startsWith(API_KEY_PREFIX)) return null
+
+  try {
+    const payload = await verifyAccessTokenRequest(requestToResourceInput(request), {
+      verifyOptions: {
+        audience: `${config.baseUrl}/api/mcp`,
+        issuer: `${config.baseUrl}/api/auth`,
+      },
+      jwksUrl: `${config.baseUrl}/api/auth/jwks`,
+    })
+
+    const principalId = payload.principalId as string | undefined
+    const sub = payload.sub
+
+    if (!principalId || !sub) return null
+
+    // Re-read the principal's current role from the database so that
+    // role changes made after token issuance take effect immediately.
+    // If the principal no longer exists (deleted/revoked), reject the token.
+    // The same read names the OAuth client for audit attribution.
+    const clientId = oauthClientIdOf(payload)
+    const principalRecord = await readOAuthPrincipal(principalId as PrincipalId, clientId)
+    if (!principalRecord) return null
+
+    const role = principalRecord.role
+    // The caller's current assignment-derived permissions, resolved as a
+    // signed-in session resolves them, gate every tool. Portal users hold no
+    // workspace assignments, so they skip the read.
+    const permissions =
+      role === 'user'
+        ? new Set<PermissionKey>()
+        : await permissionsForPrincipal(principalId as PrincipalId, role as Role)
+
+    // Parse granted scopes from space-separated string
+    const scopeStr = (payload.scope as string) ?? ''
+    const scopes = scopeStr
+      .split(' ')
+      .filter((s): s is McpScope => ALL_SCOPES.includes(s as McpScope))
+
+    return {
+      principalId: principalId as McpAuthContext['principalId'],
+      userId: sub as McpAuthContext['userId'],
+      name: (payload.name as string) ?? 'Unknown',
+      email: payload.email as string | undefined,
+      role: role as Role,
+      permissions,
+      authMethod: 'oauth',
+      ...(typeof payload.azp === 'string' && payload.azp ? { credentialId: payload.azp } : {}),
+      scopes,
+      auditAttribution: oauthClientAttribution({
+        clientId,
+        clientName: principalRecord.clientName,
+        principalId: principalId as PrincipalId,
+      }),
+    }
+  } catch {
+    return null
+  }
+}
+
+/** The client a JWT access token was issued to (`client_id`, or `azp`). */
+function oauthClientIdOf(payload: Record<string, unknown>): string | null {
+  const clientId = payload.client_id ?? payload.azp
+  return typeof clientId === 'string' && clientId.length > 0 ? clientId : null
+}
+
+/**
+ * Resolve auth context: try OAuth token first, then API key.
+ * Returns 401 with WWW-Authenticate header if both fail (triggers OAuth discovery).
+ */
+export async function resolveAuthContext(request: Request): Promise<McpAuthContext | Response> {
+  const token = extractBearerToken(request)
+
+  // 1. Try OAuth access token
+  if (token) {
+    const oauthContext = await resolveOAuthContext(request, token)
+    if (oauthContext) return oauthContext
+  }
+
+  // 2. Try API key
+  if (token?.startsWith(API_KEY_PREFIX)) {
+    let authResult
+    try {
+      // A valid key authenticates the MCP request; per-tool MCP scopes provide
+      // authorization, resolved below from the key's stored scopes.
+      authResult = await withApiKeyAuth(request)
+    } catch (err) {
+      if (!(err instanceof DomainException)) throw err
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+      if (err instanceof RateLimitError) headers['Retry-After'] = String(err.retryAfter)
+      if (err.statusCode === 401) {
+        headers['WWW-Authenticate'] = unauthenticatedMcpChallenge()
+      }
+      return new Response(JSON.stringify({ error: err.message }), {
+        status: err.statusCode,
+        headers,
+      })
+    }
+
+    // withApiKeyAuth already read the principal (with its linked user) in its
+    // single per-request query; reuse that row instead of a second round-trip.
+    const principalRecord = authResult.principal
+
+    if (!principalRecord) {
+      return new Response(JSON.stringify({ error: 'Principal not found' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    // A key's MCP scopes are its stored scopes; keys created before scope
+    // selection existed store NULL and keep full authority (deliberate
+    // back-compat — the same rule the REST permission gates apply).
+    const keyScopes = effectiveScopes(authResult.apiKey.scopes)
+
+    // Changes made over MCP with a key are attributed to the key and to the
+    // teammate who created it.
+    const auditAttribution = apiKeyAttribution(authResult.apiKey, 'mcp')
+
+    // Role and permissions are the key's authority exactly as the REST API
+    // resolves it, capped at its creator's current access; the permission set
+    // is the ceiling every MCP actor built from this context carries.
+    // Service principals (API keys) use displayName; human principals use user.name.
+    if (principalRecord.type === 'service') {
+      return {
+        principalId: authResult.principalId,
+        name: principalRecord.displayName ?? authResult.apiKey.name,
+        role: authResult.role as Role,
+        permissions: authResult.permissions,
+        ...(authResult.scopePrincipalId ? { scopePrincipalId: authResult.scopePrincipalId } : {}),
+        authMethod: 'api-key',
+        credentialId: authResult.apiKey.id,
+        clientName: authResult.apiKey.name,
+        scopes: keyScopes,
+        auditAttribution,
+      }
+    }
+
+    // Human principal (legacy path, shouldn't happen with new keys)
+    return {
+      principalId: authResult.principalId,
+      userId: principalRecord.user?.id,
+      name: principalRecord.displayName ?? principalRecord.user?.name ?? 'Unknown',
+      email: principalRecord.user?.email ?? undefined,
+      role: authResult.role as Role,
+      permissions: authResult.permissions,
+      ...(authResult.scopePrincipalId ? { scopePrincipalId: authResult.scopePrincipalId } : {}),
+      authMethod: 'api-key',
+      credentialId: authResult.apiKey.id,
+      clientName: authResult.apiKey.name,
+      scopes: keyScopes,
+      auditAttribution,
+    }
+  }
+
+  // 3. No valid auth — return 401 with OAuth discovery hint
+  return unauthenticatedMcpResponse()
+}
+
+/**
+ * OAuth-only: if this JSON-RPC call needs a scope the token lacks, return
+ * HTTP 403 + `insufficient_scope` so the client can step up. API keys never
+ * enter this path.
+ */
+async function oauthScopeStepUp(request: Request, auth: McpAuthContext): Promise<Response | null> {
+  if (request.method !== 'POST') return null
+  const contentType = request.headers.get('content-type') ?? ''
+  if (!contentType.includes('application/json')) return null
+  let body: unknown
+  try {
+    body = await request.clone().json()
+  } catch {
+    return null
+  }
+  const missing = requiredScopesForMcpRpc(body).find((scope) => !hasApiScope(auth.scopes, scope))
+  if (!missing) return null
+  return insufficientScopeChallenge(missing)
+}
+
+/**
+ * Create a stateless transport + server, handle the request, clean up.
+ *
+ * The request is its own audit boundary from the first line, labelled MCP
+ * before any auth runs: key auth fills this boundary with the key and keeps
+ * the label, so nothing in an MCP request reads as the REST API.
+ */
+export function handleMcpRequest(request: Request): Promise<Response> {
+  return runWithAuditAttribution(MCP_ATTRIBUTION, () => handleMcpRequestInBoundary(request))
+}
+
+async function handleMcpRequestInBoundary(request: Request): Promise<Response> {
+  const devConfig = await getDeveloperConfig()
+  if (!devConfig.mcpEnabled) {
+    return jsonRpcError(
+      403,
+      'MCP server is disabled. Enable it in Settings > Developers > MCP Server.'
+    )
+  }
+
+  const auth = await resolveAuthContext(request)
+  // resolveAuthContext returns a Response by design: it covers both OAuth and
+  // API key auth paths, and the API key path converts failures to Response
+  // objects internally rather than throwing.
+  if (auth instanceof Response) return auth
+
+  // From here on, everything in this request runs as the credential that
+  // made it.
+  if (auth.auditAttribution) setAuditAttribution(auth.auditAttribution)
+
+  if (auth.authMethod === 'oauth') {
+    const denied = await oauthScopeStepUp(request, auth)
+    if (denied) return denied
+  }
+
+  // Plan gate, deliberately after auth: a 402 names the workspace's plan, which
+  // is an answer only a caller who has already identified itself should get.
+  // No-op on any install without a plan, which is every self-hosted one — see
+  // domains/settings/cloud/entitlements.ts.
+  const { requireEntitlement } = await import('@/lib/server/domains/settings/cloud/entitlements')
+  try {
+    await requireEntitlement('mcpServer')
+  } catch (err) {
+    if (!(err instanceof EntitlementRequiredError)) throw err
+    return jsonRpcEntitlementError(err)
+  }
+
+  // Portal user access check
+  if (auth.role === 'user') {
+    if (!devConfig.mcpPortalAccessEnabled) {
+      return jsonRpcError(403, 'Portal user MCP access is disabled by the administrator.')
+    }
+  }
+
+  return serveMcpRequest(request, auth)
+}
+
+async function serveMcpRequest(request: Request, auth: McpAuthContext): Promise<Response> {
+  const transport = new WebStandardStreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true,
+  })
+
+  const server = createMcpServer(auth)
+  await server.connect(transport)
+
+  try {
+    return await transport.handleRequest(request)
+  } finally {
+    await transport.close()
+    await server.close()
+  }
+}

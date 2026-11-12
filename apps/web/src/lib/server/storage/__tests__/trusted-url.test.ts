@@ -1,0 +1,113 @@
+/**
+ * isTrustedAttachmentUrl gates which URLs may appear as conversation attachments and
+ * inline chatImage srcs — anything else becomes a third-party fetch fired from
+ * an agent's browser. The path-boundary cases matter most: on a path-style
+ * object store, `/bucket` must not admit `/bucket-evil/...` (a sibling bucket
+ * on the same host is attacker-creatable).
+ */
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const mockConfig = {
+  baseUrl: 'https://app.example.com',
+  s3PublicUrl: undefined as string | undefined,
+}
+
+vi.mock('@/lib/server/config', () => ({ config: mockConfig }))
+
+const { isTrustedAttachmentUrl, namesPipelineFile, PIPELINE_FILES_PREFIX } =
+  await import('@/lib/server/storage/trusted-url')
+const { withWorkspace } = await import('@/lib/server/__tests__/workspace-scope')
+
+beforeEach(() => {
+  mockConfig.baseUrl = 'https://app.example.com'
+  mockConfig.s3PublicUrl = undefined
+})
+
+describe('isTrustedAttachmentUrl — app storage route', () => {
+  it('accepts own-app /api/storage/ URLs (absolute and relative)', () => {
+    expect(isTrustedAttachmentUrl('https://app.example.com/api/storage/x/y.png')).toBe(true)
+    expect(isTrustedAttachmentUrl('/api/storage/x/y.png')).toBe(true)
+  })
+
+  it('rejects other hosts and non-http(s) schemes', () => {
+    expect(isTrustedAttachmentUrl('https://evil.example.com/api/storage/x.png')).toBe(false)
+    expect(isTrustedAttachmentUrl("javascript:'/api/storage/'")).toBe(false)
+  })
+
+  it('rejects dot-segment escapes out of the storage prefix', () => {
+    expect(isTrustedAttachmentUrl('https://app.example.com/api/storage/../x.png')).toBe(false)
+  })
+
+  it('accepts legacy absolute srcs on the workspace system host and friendly host', () => {
+    const ok = withWorkspace(
+      'workspace-alpha',
+      () => ({
+        system: isTrustedAttachmentUrl('https://ws-abc123.quackback.co.uk/api/storage/x.png'),
+        friendly: isTrustedAttachmentUrl('https://acme.quackback.co.uk/api/storage/x.png'),
+        relative: isTrustedAttachmentUrl('/api/storage/x.png'),
+        other: isTrustedAttachmentUrl('https://evil.example.com/api/storage/x.png'),
+      }),
+      {
+        storage: { publicUrl: 'https://ws-abc123.quackback.co.uk/api/storage' },
+        baseUrl: 'https://acme.quackback.co.uk',
+      }
+    )
+    expect(ok).toEqual({ system: true, friendly: true, relative: true, other: false })
+  })
+})
+
+describe('isTrustedAttachmentUrl — S3_PUBLIC_URL path boundary', () => {
+  it('accepts objects under a path-style public URL', () => {
+    mockConfig.s3PublicUrl = 'https://minio.example.com/app-bucket'
+    expect(isTrustedAttachmentUrl('https://minio.example.com/app-bucket/2026/x.png')).toBe(true)
+  })
+
+  it('accepts objects when the public URL has a trailing slash', () => {
+    mockConfig.s3PublicUrl = 'https://minio.example.com/app-bucket/'
+    expect(isTrustedAttachmentUrl('https://minio.example.com/app-bucket/2026/x.png')).toBe(true)
+  })
+
+  it('rejects a sibling bucket whose name extends the configured one', () => {
+    mockConfig.s3PublicUrl = 'https://minio.example.com/app-bucket'
+    expect(isTrustedAttachmentUrl('https://minio.example.com/app-bucket-evil/x.png')).toBe(false)
+  })
+
+  it('rejects a sibling bucket when the public URL has a trailing slash', () => {
+    mockConfig.s3PublicUrl = 'https://minio.example.com/app-bucket/'
+    expect(isTrustedAttachmentUrl('https://minio.example.com/app-bucket-evil/x.png')).toBe(false)
+  })
+
+  it('accepts any path on a host-only public URL (virtual-hosted bucket)', () => {
+    mockConfig.s3PublicUrl = 'https://cdn.example.com'
+    expect(isTrustedAttachmentUrl('https://cdn.example.com/anything/x.png')).toBe(true)
+  })
+
+  it('still rejects other hosts when a public URL is configured', () => {
+    mockConfig.s3PublicUrl = 'https://minio.example.com/app-bucket'
+    expect(isTrustedAttachmentUrl('https://evil.example.com/app-bucket/x.png')).toBe(false)
+  })
+})
+
+describe('namesPipelineFile', () => {
+  it('names the prefix the files domain stores under', async () => {
+    const { FILES_PREFIX } = await import('@/lib/server/domains/files/files.service')
+    expect(PIPELINE_FILES_PREFIX).toBe(FILES_PREFIX)
+  })
+
+  it('matches a pipeline key on the storage route of any host, encoded or not', () => {
+    expect(namesPipelineFile('/api/storage/files/2026/10/a.pdf?read=x&exp=1')).toBe(true)
+    expect(namesPipelineFile('/api/storage/files%2F2026%2F10%2Fa.pdf')).toBe(true)
+    expect(namesPipelineFile('https://old.example.com/api/storage/files/a.pdf')).toBe(true)
+    expect(namesPipelineFile('/api/storage/filesystem/a.pdf')).toBe(false)
+    expect(namesPipelineFile('/api/storage/chat-images/files/a.png')).toBe(false)
+    expect(namesPipelineFile('https://cdn.example.com/files/a.pdf')).toBe(false)
+  })
+
+  it('matches a pipeline key under the public bucket URL', () => {
+    mockConfig.s3PublicUrl = 'https://minio.example.com/app-bucket'
+    expect(namesPipelineFile('https://minio.example.com/app-bucket/files/2026/10/a.pdf')).toBe(true)
+    expect(namesPipelineFile('https://minio.example.com/app-bucket/files%2F2026/a.pdf')).toBe(true)
+    expect(namesPipelineFile('https://minio.example.com/app-bucket/chat-images/a.png')).toBe(false)
+    expect(namesPipelineFile('https://minio.example.com/other-bucket/files/a.pdf')).toBe(false)
+  })
+})

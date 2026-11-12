@@ -1,0 +1,199 @@
+import { useMemo } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
+import { useRouter } from '@tanstack/react-router'
+import { CommentThread } from './comment-thread'
+import { useAuthPopoverSafe } from '@/components/auth/auth-popover-context'
+import { useAuthBroadcast } from '@/lib/client/hooks/use-auth-broadcast'
+import { useEnsureAnonSession } from '@/lib/client/hooks/use-ensure-anon-session'
+import { useCreateComment } from '@/lib/client/mutations/portal-comments'
+import type { PublicCommentView } from '@/lib/client/queries/portal-detail'
+import type { ReplyPolicy } from '@/lib/shared/db-types'
+import type { PostCommentId, PostId, PrincipalId } from '@quackback/ids'
+import { resolveCommentingState } from '@/components/public/comment-permission'
+import { useSessionContext, useWorkspaceSettings } from '@/lib/client/hooks/use-root-context'
+import { shownName } from '@/lib/shared/greeting-name'
+
+interface AuthCommentsSectionProps {
+  postId: PostId
+  comments: PublicCommentView[]
+  /** Server-determined: user is authenticated member who can comment */
+  allowCommenting?: boolean
+  /**
+   * Server-reported board reply rule. Only used to explain a denial; the
+   * decision itself already lives in `allowCommenting`. Undefined = 'anyone'.
+   */
+  replyPolicy?: ReplyPolicy
+  user?: { name: string | null; email: string; principalId?: PrincipalId }
+  /** Message to show when comments are locked (overrides "Sign in to comment") */
+  lockedMessage?: string
+  /** ID of the pinned comment (for showing pinned indicator) */
+  pinnedCommentId?: string | null
+  // Admin mode props
+  /** Enable comment pinning (admin only) */
+  canPinComments?: boolean
+  /** Callback when comment is pinned */
+  onPinComment?: (commentId: PostCommentId) => void
+  /** Callback when comment is unpinned */
+  onUnpinComment?: () => void
+  /** Whether pin/unpin is in progress */
+  isPinPending?: boolean
+  // Status change props (admin only)
+  /** Available statuses for the comment form status selector */
+  statuses?: Array<{ id: string; name: string; color: string }>
+  /** Current post status ID */
+  currentStatusId?: string | null
+  /** Whether the current user is a team member */
+  isTeamMember?: boolean
+  /** Link comment authors to a profile behind a hover card. */
+  linkAuthors?: boolean
+  /** Destination for author links. Admin uses the enriched hover card. */
+  authorLinkTo?: 'portal' | 'admin'
+  /** Hide the comment form area entirely (for readonly previews) */
+  hideCommentForm?: boolean
+  /** Callback when a comment is deleted */
+  onDeleteComment?: (commentId: PostCommentId) => void
+  /** ID of the comment currently being deleted */
+  deletingCommentId?: PostCommentId | null
+  /** Callback when a comment is restored (team only) */
+  onRestoreComment?: (commentId: PostCommentId) => void
+  /** ID of the comment currently being restored */
+  restoringCommentId?: PostCommentId | null
+  onImageUpload?: (file: File) => Promise<string>
+  canModerate?: boolean
+}
+
+/**
+ * CommentsSection wrapper that reactively handles auth state.
+ * - Shows comment form when logged in
+ * - Shows "Sign in to comment" when logged out
+ * - Updates reactively on login/logout without page refresh
+ * - Uses optimistic updates for instant comment appearance
+ */
+export function AuthCommentsSection({
+  postId,
+  comments,
+  allowCommenting: serverAllowCommenting = false,
+  replyPolicy,
+  user: serverUser,
+  lockedMessage,
+  pinnedCommentId,
+  canPinComments = false,
+  onPinComment,
+  onUnpinComment,
+  isPinPending = false,
+  statuses,
+  currentStatusId,
+  isTeamMember,
+  linkAuthors = false,
+  authorLinkTo = 'portal',
+  hideCommentForm,
+  onDeleteComment,
+  deletingCommentId,
+  onRestoreComment,
+  restoringCommentId,
+  onImageUpload,
+  canModerate = false,
+}: AuthCommentsSectionProps) {
+  const router = useRouter()
+  const queryClient = useQueryClient()
+  const session = useSessionContext()
+  const settings = useWorkspaceSettings()
+  // Use safe version - returns null in admin context where provider isn't available
+  const authPopover = useAuthPopoverSafe()
+
+  // Refresh page on auth change to get updated server state (member status, user data)
+  useAuthBroadcast({
+    onSuccess: () => {
+      // Invalidate auth-dependent queries so they refetch with new session
+      queryClient.invalidateQueries({ queryKey: ['comments-section', postId] })
+      queryClient.invalidateQueries({ queryKey: ['vote-sidebar', postId] })
+      queryClient.invalidateQueries({ queryKey: ['votedPosts'] })
+      router.invalidate()
+    },
+  })
+
+  // Follow the SERVER-computed permission, which already composes the board's
+  // per-action comment tier with the workspace anonymous master switch for
+  // this viewer. `needsAnonSession` drives the lazy-session path below (no real
+  // user session yet, but commenting is allowed — e.g. an anonymous visitor on
+  // an anonymous-comment board).
+  const { allowCommenting, surfaceSessionUser, needsAnonSession, noAccess } =
+    resolveCommentingState(serverAllowCommenting, session)
+  const user = surfaceSessionUser ? (session?.user ?? null) : null
+
+  // User info from session, falling back to server-provided user
+  const userData = user
+    ? {
+        name: shownName(user.name, user.email),
+        email: user.email ?? '',
+        principalId: serverUser?.principalId,
+      }
+    : serverUser
+
+  const ensureAnonSession = useEnsureAnonSession()
+
+  // Use mutation hook with optimistic updates
+  const baseMutation = useCreateComment({
+    postId,
+    author: userData,
+  })
+
+  // Wrap mutation to lazily create anonymous session before commenting
+  const createComment = useMemo(() => {
+    if (!needsAnonSession) return baseMutation
+    return {
+      ...baseMutation,
+      mutate: (
+        input: Parameters<typeof baseMutation.mutate>[0],
+        options?: Parameters<typeof baseMutation.mutate>[1]
+      ) => {
+        ensureAnonSession()
+          .then((ok) => {
+            if (ok) baseMutation.mutate(input, options)
+          })
+          .catch(() => {})
+      },
+      mutateAsync: async (
+        input: Parameters<typeof baseMutation.mutateAsync>[0],
+        options?: Parameters<typeof baseMutation.mutateAsync>[1]
+      ) => {
+        const ok = await ensureAnonSession()
+        if (!ok) throw new Error('Failed to create session')
+        return baseMutation.mutateAsync(input, options)
+      },
+    } as typeof baseMutation
+  }, [needsAnonSession, baseMutation, ensureAnonSession])
+
+  return (
+    <CommentThread
+      postId={postId}
+      comments={comments}
+      allowCommenting={allowCommenting}
+      noAccess={noAccess}
+      replyPolicy={replyPolicy}
+      user={userData}
+      teamBadgeLogoUrl={settings?.brandingData?.logoUrl ?? undefined}
+      teamBadgeLabel={settings?.brandingData?.name ?? settings?.name ?? undefined}
+      lockedMessage={lockedMessage}
+      onAuthRequired={() => authPopover?.openAuthPopover({ mode: 'login' })}
+      createComment={createComment}
+      pinnedCommentId={pinnedCommentId}
+      canPinComments={canPinComments}
+      onPinComment={onPinComment}
+      onUnpinComment={onUnpinComment}
+      isPinPending={isPinPending}
+      statuses={statuses}
+      currentStatusId={currentStatusId}
+      isTeamMember={isTeamMember}
+      linkAuthors={linkAuthors}
+      authorLinkTo={authorLinkTo}
+      hideCommentForm={hideCommentForm}
+      onDeleteComment={onDeleteComment}
+      deletingCommentId={deletingCommentId}
+      onRestoreComment={onRestoreComment}
+      restoringCommentId={restoringCommentId}
+      onImageUpload={onImageUpload}
+      canModerate={canModerate}
+    />
+  )
+}

@@ -1,0 +1,203 @@
+/**
+ * Inbox query hooks
+ *
+ * Query hooks for fetching admin inbox posts and post details.
+ * Mutations are in lib/mutations/posts.ts and lib/mutations/comments.ts
+ */
+
+import {
+  useQuery,
+  useInfiniteQuery,
+  infiniteQueryOptions,
+  queryOptions,
+  keepPreviousData,
+  type InfiniteData,
+  type QueryClient,
+} from '@tanstack/react-query'
+import {
+  fetchInboxPostsForAdmin,
+  fetchInboxFilterCounts,
+  fetchPostWithDetails,
+} from '@/lib/server/functions/posts'
+import type { InboxFilters, PostDetails } from '@/lib/shared/types'
+import { mergeSuggestionQueries } from '@/lib/client/queries/signals'
+import type { PostListItem, InboxPostListResult } from '@/lib/shared/db-types'
+import type { BoardId, PrincipalId, PostId, PostTagId, SegmentId } from '@quackback/ids'
+
+// ============================================================================
+// Types
+// ============================================================================
+
+interface UseInboxPostsOptions {
+  filters: InboxFilters
+}
+
+interface UsePostDetailOptions {
+  postId: PostId | null
+  enabled?: boolean
+}
+
+// ============================================================================
+// Query Key Factory
+// ============================================================================
+
+export const inboxKeys = {
+  all: ['inbox'] as const,
+  lists: () => [...inboxKeys.all, 'list'] as const,
+  list: (filters: InboxFilters) => [...inboxKeys.lists(), filters] as const,
+  /** Nested under lists() so mutations that invalidate the list also refresh counts. */
+  facetCounts: (filters: InboxFilters) => [...inboxKeys.lists(), 'facet-counts', filters] as const,
+  details: () => [...inboxKeys.all, 'detail'] as const,
+  detail: (postId: PostId) => [...inboxKeys.details(), postId] as const,
+}
+
+// ============================================================================
+// Fetch Functions
+// ============================================================================
+
+/** Shared list/count payload. Sort, cursor, and limit are list-only. */
+function toInboxListInput(filters: InboxFilters) {
+  return {
+    boardIds: filters.board as BoardId[] | undefined,
+    statusSlugs: filters.status,
+    tagIds: filters.tags as PostTagId[] | undefined,
+    segmentIds: filters.segmentIds as SegmentId[] | undefined,
+    ownerId: (filters.owner || undefined) as PrincipalId | null | undefined,
+    search: filters.search,
+    dateFrom: filters.dateFrom,
+    dateTo: filters.dateTo,
+    minVotes: filters.minVotes,
+    minComments: filters.minComments,
+    responded: filters.responded,
+    updatedBefore: filters.updatedBefore,
+    showDeleted: filters.showDeleted,
+    hasDuplicates: filters.hasDuplicates,
+  }
+}
+
+/** Sort does not affect facet counts, so drop it from the counts cache key. */
+function facetCountFilters(filters: InboxFilters): InboxFilters {
+  const { sort: _sort, ...rest } = filters
+  return rest
+}
+
+/**
+ * One page of the list. The page arrives with its posts' pending merge
+ * suggestion counts, which seed the per-page counts query the rows' duplicate
+ * badges read (`mergeSuggestionQueries.countsForPosts`, keyed by the page's ids
+ * in order), so the badges need no request of their own.
+ */
+async function fetchInboxPosts(
+  client: QueryClient,
+  filters: InboxFilters,
+  cursor?: string
+): Promise<InboxPostListResult> {
+  const { duplicateCounts, ...page } = await fetchInboxPostsForAdmin({
+    data: {
+      ...toInboxListInput(filters),
+      sort: filters.sort,
+      cursor,
+      limit: 20,
+    },
+  })
+  const ids = page.items.map((p) => p.id as PostId)
+  client.setQueryData(mergeSuggestionQueries.countsForPosts(ids).queryKey, duplicateCounts)
+  return page as unknown as InboxPostListResult
+}
+
+async function fetchPostDetail(postId: PostId): Promise<PostDetails> {
+  return (await fetchPostWithDetails({
+    data: {
+      id: postId,
+    },
+  })) as unknown as PostDetails
+}
+
+// ============================================================================
+// Shared Query Options (QC-1)
+// ============================================================================
+
+/** The order the inbox lists in when the URL names none. */
+export const DEFAULT_INBOX_SORT = 'newest' satisfies InboxFilters['sort']
+
+/**
+ * The unfiltered inbox filter set. The route loader warms the infinite cache
+ * with exactly this shape so the renderer's `useInboxPosts` reads the same
+ * cache entry on first paint (React Query hashes `undefined` fields away, so
+ * this hashes identically to the empty-search filters the hook builds, which
+ * carry the default sort).
+ */
+export const defaultInboxFilters: InboxFilters = { sort: DEFAULT_INBOX_SORT }
+
+/**
+ * ONE canonical definition of the inbox infinite query, shared by the route
+ * loader (via `ensureInfiniteQueryData`) and the renderer's `useInboxPosts`
+ * hook. Collapsing the previously-split `adminQueries.inboxPosts` namespace and
+ * this infinite query into a single key/queryFn (QC-1) means post mutations
+ * that invalidate `inboxKeys.lists()` reach the cache the UI actually renders,
+ * so navigating back no longer serves stale data.
+ */
+export function inboxPostsInfiniteOptions(filters: InboxFilters) {
+  return infiniteQueryOptions({
+    queryKey: inboxKeys.list(filters),
+    queryFn: ({ pageParam, client }) => fetchInboxPosts(client, filters, pageParam),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+    // NOTE (QC-2): no `maxPages` here. This cursor is a one-directional keyset
+    // (last-item id, forward-only `<` comparison server-side — see
+    // post.inbox.ts) with no reverse cursor returned, so there's no clean
+    // `getPreviousPageParam` to pair it with; capping pages would silently
+    // drop the scrolled-past head with no way back. Skipped per QC-2's escape
+    // hatch — would need a server-side reverse-cursor query to support this.
+  })
+}
+
+// ============================================================================
+// Query Hooks
+// ============================================================================
+
+export function useInboxPosts({ filters }: UseInboxPostsOptions) {
+  return useInfiniteQuery({
+    ...inboxPostsInfiniteOptions(filters),
+    placeholderData: keepPreviousData,
+  })
+}
+
+/**
+ * Facet counts for the inbox filter pane. Nested under `inboxKeys.lists()` so
+ * post mutations that invalidate the list also refresh counts.
+ */
+export function inboxFacetCountsOptions(filters: InboxFilters) {
+  const countFilters = facetCountFilters(filters)
+  return queryOptions({
+    queryKey: inboxKeys.facetCounts(countFilters),
+    queryFn: () => fetchInboxFilterCounts({ data: toInboxListInput(countFilters) }),
+    placeholderData: keepPreviousData,
+    staleTime: 15_000,
+  })
+}
+
+export function useInboxFacetCounts(filters: InboxFilters) {
+  return useQuery(inboxFacetCountsOptions(filters))
+}
+
+export function usePostDetail({ postId, enabled = true }: UsePostDetailOptions) {
+  return useQuery({
+    queryKey: inboxKeys.detail(postId!),
+    queryFn: () => fetchPostDetail(postId!),
+    enabled: enabled && !!postId,
+    staleTime: 30 * 1000,
+  })
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/** Flatten paginated posts into a single array */
+export function flattenInboxPosts(
+  data: InfiniteData<InboxPostListResult> | undefined
+): PostListItem[] {
+  if (!data) return []
+  return data.pages.flatMap((page) => page.items)
+}

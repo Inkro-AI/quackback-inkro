@@ -1,0 +1,122 @@
+/**
+ * Activity Service - Post activity log CRUD
+ *
+ * Records meaningful state changes on posts: status transitions, merges,
+ * tag changes, owner assignments, etc. Activity inserts are fire-and-forget
+ * and should never block or fail the parent operation.
+ */
+
+import { db, postActivity, eq, desc, principal as principalTable } from '@/lib/server/db'
+import type { PostId, PrincipalId } from '@quackback/ids'
+import { isOnTeam } from '@/lib/server/domains/principals/principal-standing'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'activity' })
+
+// ============================================
+// Types
+// ============================================
+
+export type ActivityType =
+  | 'post.created'
+  | 'post.deleted'
+  | 'post.restored'
+  | 'status.changed'
+  | 'post.board_changed'
+  | 'post.merged_in'
+  | 'post.merged_away'
+  | 'post.unmerged'
+  | 'vote.proxy'
+  | 'vote.removed'
+  | 'owner.assigned'
+  | 'owner.unassigned'
+  | 'tags.added'
+  | 'tags.removed'
+  | 'comments.locked'
+  | 'comments.unlocked'
+  | 'comment.pinned'
+  | 'comment.unpinned'
+  | 'comment.deleted'
+  | 'comment.removed'
+  | 'comment.restored'
+  | 'external.status_changed'
+
+export interface CreateActivityOpts {
+  postId: PostId
+  principalId: PrincipalId | null
+  type: ActivityType
+  metadata?: Record<string, unknown>
+}
+
+export interface ActivityRow {
+  id: string
+  postId: string
+  principalId: string | null
+  // Stored rows may contain retired activity values. Reads keep the raw string,
+  // while CreateActivityOpts only accepts currently supported variants.
+  type: string
+  // oxlint-disable-next-line @typescript-eslint/no-explicit-any
+  metadata: Record<string, any>
+  createdAt: Date
+  /** Read live from the actor's principal, so it is whatever name they hold now. */
+  actorName: string | null
+  /**
+   * The actor is a teammate or a service principal today, so the team controls
+   * actorName. False for portal users, former teammates and missing actors.
+   */
+  actorOnTeam: boolean
+}
+
+// ============================================
+// Create
+// ============================================
+
+/**
+ * Record a post activity event. Fire-and-forget - never throws.
+ */
+export function createActivity(opts: CreateActivityOpts): void {
+  db.insert(postActivity)
+    .values({
+      postId: opts.postId,
+      principalId: opts.principalId,
+      type: opts.type,
+      metadata: opts.metadata ?? {},
+    })
+    .catch((err) => {
+      log.error({ activity_type: opts.type, err }, 'failed to create activity')
+    })
+}
+
+// ============================================
+// Query
+// ============================================
+
+/**
+ * Get activity for a post, ordered by creation time (newest first).
+ * Resolves actor names from the principal table.
+ * Limited to 200 most recent entries to prevent unbounded growth.
+ */
+export async function getActivityForPost(postId: PostId): Promise<ActivityRow[]> {
+  const rows = await db
+    .select({
+      id: postActivity.id,
+      postId: postActivity.postId,
+      principalId: postActivity.principalId,
+      type: postActivity.type,
+      metadata: postActivity.metadata,
+      createdAt: postActivity.createdAt,
+      actorName: principalTable.displayName,
+      actorType: principalTable.type,
+      actorRole: principalTable.role,
+    })
+    .from(postActivity)
+    .leftJoin(principalTable, eq(postActivity.principalId, principalTable.id))
+    .where(eq(postActivity.postId, postId))
+    .orderBy(desc(postActivity.createdAt))
+    .limit(200)
+
+  return rows.map(({ actorType, actorRole, ...row }) => ({
+    ...row,
+    actorOnTeam: isOnTeam({ type: actorType, role: actorRole }),
+  })) as ActivityRow[]
+}

@@ -1,0 +1,605 @@
+/**
+ * Append-only audit log helper.
+ *
+ * One call per security-sensitive admin action. Best-effort: insert
+ * failures are logged and swallowed so the primary mutation isn't
+ * blocked by audit-log downtime. Callers must not rely on the row
+ * being visible to a subsequent SELECT in the same transaction —
+ * inserts are made on the global connection, not the caller's tx.
+ */
+import {
+  db,
+  auditLog,
+  and,
+  desc,
+  eq,
+  gte,
+  lte,
+  ilike,
+  inArray,
+  notInArray,
+  principal,
+  user,
+  type Transaction,
+} from '@/lib/server/db'
+import { createHash } from 'node:crypto'
+import { sql, type SQL } from 'drizzle-orm'
+import { fromUuid, type PrincipalId, type UserId } from '@quackback/ids'
+import type { AuditChannel, AuditCredentialKind } from '@/lib/shared/audit-attribution'
+import { getClientIp } from '@/lib/server/domains/api/rate-limit'
+import type { AuthContext } from '@/lib/server/functions/auth-helpers'
+import { logger } from '@/lib/server/logger'
+import type { JsonValue } from '@/lib/shared/json'
+import { auditAttributionColumns } from './attribution'
+
+const log = logger.child({ component: 'audit' })
+
+/** A JSON-shaped value — fits into a Postgres jsonb column. Re-exported from the
+ *  shared module so client/shared code can reference it without importing from
+ *  `@/lib/server`. */
+export type { JsonValue }
+
+/**
+ * Closed taxonomy of audit event types.
+ *
+ * Add new entries as features land. Existing rows reference the
+ * string literal directly so reordering / renaming is a schema-level
+ * change — never reuse a retired identifier.
+ */
+export type AuditEventType =
+  | 'branding.website.applied'
+  | 'branding.website.undone'
+  | 'copilot.settings.applied'
+  | 'copilot.settings.undone'
+  // Settings registry: a direct write to one area, and its undo. The audit row
+  // of a write is the receipt the undo names.
+  | 'settings.applied'
+  | 'settings.undone'
+  | 'sso.enforcement.domain.enabled'
+  | 'sso.enforcement.domain.disabled'
+  | 'sso.config.changed'
+  // Multi-provider identity-provider CRUD (Task 15)
+  | 'idp.created'
+  | 'idp.updated'
+  | 'idp.deleted'
+  | 'idp.credentials.changed'
+  | 'idp.domain.enforced'
+  | 'idp.domain.unenforced'
+  | 'sso.recovery_codes.generated'
+  | 'sso.recovery_codes.used'
+  | 'sso.recovery_codes.invalidated'
+  | 'auth.password.enabled'
+  | 'auth.password.disabled'
+  | 'auth.magic_link.enabled'
+  | 'auth.magic_link.disabled'
+  | 'auth.method.blocked'
+  | 'auth.signin.success'
+  | 'auth.signin.new_device'
+  | 'auth.signin.rate_limited'
+  | 'session.revoked.bulk'
+  | 'session.revoked.individual'
+  | 'user.role.changed'
+  | 'user.invited'
+  | 'user.removed'
+  // Custom-role CRUD (role.manage)
+  | 'role.created'
+  | 'role.updated'
+  | 'role.deleted'
+  | 'two_factor.reset_by_admin'
+  | 'two_factor.enabled'
+  | 'two_factor.disabled'
+  // OAuth provider — see auth/refresh-grace.ts (temporary, better-auth#8512)
+  | 'oauth.refresh_token.grace_heal'
+  // v1 access controls
+  | 'board.access.changed'
+  | 'moderation.default.changed'
+  | 'portal.visibility.changed'
+  | 'portal.allowed_domains.changed'
+  | 'post.moderation.approved'
+  | 'post.moderation.rejected'
+  | 'post.moderation.held'
+  | 'comment.moderation.approved'
+  | 'comment.moderation.rejected'
+  | 'comment.moderation.held'
+  | 'segment.member.added'
+  | 'segment.member.removed'
+  | 'segment.sso_mapping.changed'
+  // v1 portal invites
+  | 'portal.invite.sent'
+  | 'portal.invite.resent'
+  | 'portal.invite.accepted'
+  | 'portal.invite.revoked'
+  | 'portal.invite.link_minted'
+  // Team-kind invitations live in the same `invitation` table as portal
+  // ones but route to admin/member onboarding (not portal access). The
+  // sweep emits a distinct event per kind so audit reviewers and
+  // compliance dashboards don't conflate the two.
+  | 'team.invite.expired'
+  // v1 portal segment allowlist
+  | 'portal.allowed_segments.changed'
+  // v1 portal widget sign-in toggle
+  | 'portal.widget_signin.changed'
+  // v1 widget OTT handoff
+  | 'portal.widget_handshake.consumed'
+  | 'portal.widget_handshake.invalid'
+  // v1 audit-log observability
+  | 'portal.access.denied' // OWASP authz_fail — gate denied an authenticated visitor
+  | 'auth.signin.failed' // OWASP authn_login_fail — twin of auth.signin.success
+  | 'portal.invite.expired' // emitted by the daily sweep for pending invites past their expiry
+  // Imports & exports hub (§I3): full-content conversation/ticket export
+  | 'export.conversations.downloaded'
+  // Workspace data export (async ZIP): requested from the hub, artifact downloaded
+  | 'export.workspace.requested'
+  | 'export.workspace.downloaded'
+  // AI config changelog: assistant customization mutations surfaced together
+  // on the assistant admin page.
+  | 'assistant.guidance.created'
+  | 'assistant.guidance.updated'
+  | 'assistant.guidance.reordered'
+  | 'assistant.guidance.deleted'
+  | 'assistant.custom_action.created'
+  | 'assistant.custom_action.updated'
+  | 'assistant.custom_action.deleted'
+  | 'assistant.connector.created'
+  | 'assistant.connector.updated'
+  | 'assistant.connector.deleted'
+  | 'assistant.connector.refreshed'
+  | 'assistant.skill.created'
+  | 'assistant.skill.updated'
+  | 'assistant.skill.deleted'
+  | 'assistant.tool_controls.changed'
+  | 'assistant.surfaces.changed'
+  | 'assistant.basics.changed'
+  | 'assistant.identity.changed'
+  | 'assistant.voice.changed'
+  | 'assistant.instructions.changed'
+  | 'assistant.knowledge.changed'
+  | 'assistant.capabilities.changed'
+  | 'assistant.tools.changed'
+  | 'assistant.channels.changed'
+  | 'assistant.deployment.changed'
+  // Verified-email assertion. `emailVerified: true` is a trust decision, not a
+  // data field — it grants the same portal access as a confirmed email
+  // (domain-match, invite claim, segment portal-access grants). Every path
+  // that lets an operator assert it without the user proving ownership emits
+  // one of these.
+  | 'user.email_verified.asserted' // per-user: admin contact creation, REST identify
+  // Restore hygiene. Written by settleExternalSideEffects (@quackback/db) when
+  // a restore stamps the external side-effect ledger so already-sent mail,
+  // webhooks and announcements are not sent a second time. The metadata
+  // carries the restore instant and the per-column outcome.
+  | 'restore.side_effects_settled'
+  // Labs: visibility or enablement changed for a registered experiment
+  | 'labs.experiment.changed'
+  // Boundary audit: one row per REST write made with an API key, and one per
+  // MCP tool call that is not read-only. Method or tool, route pattern,
+  // target and outcome only; never a request body or a credential.
+  | 'api.write'
+  | 'mcp.tool_call'
+  // A bulk import's writes, summarised: one row per API key per minute with
+  // a count, in place of an api.write row each.
+  | 'api.import'
+  // First-run setup by an operator holding the setup token: the workspace and
+  // its first admin created without the browser wizard, or a refused attempt.
+  | 'workspace.setup.completed'
+  | 'workspace.setup.rejected'
+  // Device sign-in (RFC 8628): a person approved or denied a headless client's code.
+  | 'oauth.device.approved'
+  | 'oauth.device.denied'
+
+export type AuditEventOutcome = 'success' | 'failure'
+
+export type AuditActorType = 'user' | 'service' | 'anonymous' | 'system' | 'api_key' | 'support'
+export type AuditAuthMethod =
+  'password' | 'sso' | 'oauth' | 'magic_link' | 'ott' | 'api_key' | 'session'
+
+export interface AuditActor {
+  userId?: UserId | null
+  email?: string | null
+  role?: string | null
+  /** Denormalised from principal.type at write time. */
+  type?: AuditActorType | null
+  /** Auth method for sign-in events; null for all others. */
+  authMethod?: AuditAuthMethod | null
+}
+
+export interface AuditTarget {
+  type: string
+  id?: string | null
+}
+
+export interface RecordAuditEventInput {
+  event: AuditEventType
+  outcome?: AuditEventOutcome
+  actor: AuditActor
+  /** Request headers — IP comes from `getClientIp`, UA from `user-agent`. */
+  headers?: Headers
+  target?: AuditTarget
+  before?: unknown
+  after?: unknown
+  metadata?: Record<string, unknown>
+}
+
+/** Map a requireAuth() result onto the audit row's denormalised actor fields. */
+export function actorFromAuth(auth: AuthContext): AuditActor {
+  return {
+    userId: auth.user.id,
+    email: auth.user.email,
+    role: auth.principal.role,
+    type: auth.principal.type as AuditActorType,
+    // authMethod is generally unknowable from a session-cookie context;
+    // sign-in events that DO know the method should set it explicitly.
+  }
+}
+
+/**
+ * Upper bound on the stored request_id. PostgreSQL's btree refuses
+ * index entries above ~2700 bytes; recordAuditEvent's catch swallows
+ * insert failures, so an attacker who can set the x-request-id header
+ * could otherwise silently suppress security events by sending a
+ * multi-KB value. 256 chars is comfortably above every legitimate
+ * correlation-id format (UUIDs, ULIDs, hex hashes, TypeIDs, OpenTelemetry
+ * traceparent payloads) while well below the btree limit.
+ */
+const REQUEST_ID_MAX_LEN = 256
+
+function capRequestId(value: string | null): string | null {
+  if (value === null) return null
+  return value.length > REQUEST_ID_MAX_LEN ? value.slice(0, REQUEST_ID_MAX_LEN) : value
+}
+
+export async function recordAuditEvent(input: RecordAuditEventInput): Promise<void> {
+  const values = auditInsertValues(input)
+
+  try {
+    await db.insert(auditLog).values(values)
+  } catch (error) {
+    log.error({ err: error, event: input.event }, 'recordAuditEvent failed')
+  }
+}
+
+function auditInsertValues(input: RecordAuditEventInput): typeof auditLog.$inferInsert {
+  const ip = input.headers ? getClientIp(input.headers) : null
+  const userAgent = input.headers?.get('user-agent') ?? null
+  const requestId = capRequestId(
+    input.headers?.get('x-request-id') ?? input.headers?.get('x-correlation-id') ?? null
+  )
+
+  return {
+    eventType: input.event,
+    eventOutcome: input.outcome ?? 'success',
+    actorUserId: input.actor.userId ?? null,
+    actorEmail: input.actor.email ?? null,
+    actorRole: input.actor.role ?? null,
+    actorIp: ip === 'unknown' ? null : ip,
+    actorUserAgent: userAgent,
+    requestId,
+    actorType: input.actor.type ?? null,
+    authMethod: input.actor.authMethod ?? null,
+    targetType: input.target?.type ?? null,
+    targetId: input.target?.id ?? null,
+    beforeValue: input.before ?? null,
+    afterValue: input.after ?? null,
+    metadata: input.metadata ?? null,
+    // How the change arrived, from the boundary the caller runs under (see
+    // attribution.ts), so no call site has to pass it.
+    ...auditAttributionColumns(),
+  }
+}
+
+/**
+ * The row id a rollup key always maps to: a name-derived UUID (version 8), so
+ * every replica counting the same key lands on the same row.
+ */
+function rollupRowId(rollupKey: string): string {
+  const bytes = createHash('sha256').update(rollupKey).digest().subarray(0, 16)
+  bytes[6] = (bytes[6] & 0x0f) | 0x80
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = bytes.toString('hex')
+  return fromUuid(
+    'audit',
+    `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+  )
+}
+
+/**
+ * Count an event into one row per `rollupKey` instead of writing a row each:
+ * the first event inserts the row with `count: 1`, and every later one adds
+ * to `count`, and to `failures` when it failed, which also marks the row a
+ * failure. One upsert per event, atomic across replicas. For bursts that
+ * would otherwise bury the rest of the log, such as a bulk import. Best
+ * effort, like recordAuditEvent.
+ */
+export async function recordAuditRollup(
+  input: RecordAuditEventInput,
+  rollupKey: string
+): Promise<void> {
+  const failed = input.outcome === 'failure'
+  const failures = failed ? 1 : 0
+  try {
+    await db
+      .insert(auditLog)
+      .values({
+        ...auditInsertValues(input),
+        id: rollupRowId(rollupKey) as typeof auditLog.$inferInsert.id,
+        metadata: { ...(input.metadata ?? {}), count: 1, failures },
+      })
+      .onConflictDoUpdate({
+        target: auditLog.id,
+        set: {
+          metadata: sql`jsonb_set(
+            jsonb_set(${auditLog.metadata}, '{count}',
+              to_jsonb(coalesce((${auditLog.metadata}->>'count')::int, 0) + 1)),
+            '{failures}',
+            to_jsonb(coalesce((${auditLog.metadata}->>'failures')::int, 0) + ${failures}::int))`,
+          ...(failed ? { eventOutcome: 'failure' } : {}),
+        },
+      })
+  } catch (error) {
+    log.error({ err: error, event: input.event }, 'recordAuditRollup failed')
+  }
+}
+
+/** Strict audit insert for mutations whose data write and audit row must commit together. */
+export async function recordAuditEventInTransaction(
+  tx: Transaction,
+  input: RecordAuditEventInput
+): Promise<string> {
+  const [row] = await tx
+    .insert(auditLog)
+    .values(auditInsertValues(input))
+    .returning({ id: auditLog.id })
+  return row.id
+}
+
+/**
+ * A single audit_log row, projected for readers. The paginated admin feed
+ * (listAuditEventsFn) returns this.
+ */
+export interface AuditEventRow {
+  id: string
+  occurredAt: string
+  actorUserId: string | null
+  actorEmail: string | null
+  actorRole: string | null
+  actorIp: string | null
+  actorUserAgent: string | null
+  eventType: string
+  eventOutcome: AuditEventOutcome
+  targetType: string | null
+  targetId: string | null
+  beforeValue: JsonValue | null
+  afterValue: JsonValue | null
+  metadata: JsonValue | null
+  // Observability columns from migration 0070. requestId is indexed —
+  // join point for "show me everything that happened during request X"
+  // forensics. actorType disambiguates user / service / anonymous in
+  // mixed-traffic timelines. authMethod records HOW the actor signed
+  // in (session, api-key, sso, magic-link) when known.
+  requestId: string | null
+  actorType: string | null
+  authMethod: string | null
+  // Attribution columns from migration 0301: how the change arrived, which
+  // credential made it, and the person it was made for (by id, and by name
+  // as that person is called now).
+  channel: AuditChannel | null
+  credentialKind: AuditCredentialKind | null
+  credentialId: string | null
+  clientName: string | null
+  onBehalfOfPrincipalId: string | null
+  onBehalfOfName: string | null
+}
+
+export interface QueryAuditEventsFilters {
+  /** Exact match against a single event type. */
+  eventType?: string
+  /** Inclusion filter against a set of event types (`inArray`) — the
+   *  companion to `excludeEventTypes`, used by readers that only ever want
+   *  a fixed, known set (e.g. the AI config changelog). Ignored when
+   *  `eventType` is also set. */
+  eventTypes?: AuditEventType[]
+  actorUserId?: UserId
+  /** Substring match against the denormalised `actor_email` column,
+   *  case-insensitive. Trimmed and lower-cased here. */
+  actorEmail?: string
+  from?: Date
+  to?: Date
+  /** Event types to exclude. Ignored when `eventType` or `eventTypes` is
+   *  set — a deliberate selection always wins over the default-hide
+   *  behaviour. */
+  excludeEventTypes?: string[]
+  limit: number
+}
+
+/**
+ * Shared row query behind the paginated admin feed (listAuditEventsFn).
+ *
+ * No auth in here — the caller holds its own `requireAuth` gate before
+ * calling in.
+ */
+export async function queryAuditEvents(filters: QueryAuditEventsFilters): Promise<AuditEventRow[]> {
+  const conditions: SQL[] = []
+  if (filters.eventType) conditions.push(eq(auditLog.eventType, filters.eventType))
+  if (filters.eventTypes && filters.eventTypes.length > 0) {
+    conditions.push(inArray(auditLog.eventType, filters.eventTypes))
+  }
+  if (filters.actorUserId) conditions.push(eq(auditLog.actorUserId, filters.actorUserId))
+  if (filters.actorEmail) {
+    conditions.push(ilike(auditLog.actorEmail, `%${filters.actorEmail.trim().toLowerCase()}%`))
+  }
+  if (filters.from) conditions.push(gte(auditLog.occurredAt, filters.from))
+  if (filters.to) conditions.push(lte(auditLog.occurredAt, filters.to))
+  if (
+    !filters.eventType &&
+    !filters.eventTypes &&
+    filters.excludeEventTypes &&
+    filters.excludeEventTypes.length > 0
+  ) {
+    conditions.push(notInArray(auditLog.eventType, filters.excludeEventTypes))
+  }
+
+  const whereClause = conditions.length > 0 ? and(...conditions) : undefined
+
+  const rows = await db
+    .select()
+    .from(auditLog)
+    .where(whereClause)
+    .orderBy(desc(auditLog.occurredAt))
+    .limit(filters.limit)
+
+  const names = await principalNames(rows.map((row) => row.onBehalfOfPrincipalId))
+
+  return rows.map((row) => ({
+    id: row.id,
+    occurredAt: row.occurredAt.toISOString(),
+    actorUserId: row.actorUserId,
+    actorEmail: row.actorEmail,
+    actorRole: row.actorRole,
+    actorIp: row.actorIp,
+    actorUserAgent: row.actorUserAgent,
+    eventType: row.eventType,
+    eventOutcome: row.eventOutcome as AuditEventOutcome,
+    targetType: row.targetType,
+    targetId: row.targetId,
+    beforeValue: (row.beforeValue as JsonValue | null) ?? null,
+    afterValue: (row.afterValue as JsonValue | null) ?? null,
+    metadata: (row.metadata as JsonValue | null) ?? null,
+    requestId: row.requestId,
+    actorType: row.actorType,
+    authMethod: row.authMethod,
+    channel: (row.channel as AuditChannel | null | undefined) ?? null,
+    credentialKind: (row.credentialKind as AuditCredentialKind | null | undefined) ?? null,
+    credentialId: row.credentialId ?? null,
+    clientName: row.clientName ?? null,
+    onBehalfOfPrincipalId: row.onBehalfOfPrincipalId ?? null,
+    onBehalfOfName: row.onBehalfOfPrincipalId
+      ? (names.get(row.onBehalfOfPrincipalId) ?? null)
+      : null,
+  }))
+}
+
+/**
+ * Display names for the people credentials acted for, in one read over the
+ * distinct ids on the page. Someone since removed has no name, and the row
+ * keeps their id.
+ */
+async function principalNames(
+  ids: ReadonlyArray<PrincipalId | null | undefined>
+): Promise<Map<string, string>> {
+  const distinct = [...new Set(ids.filter((id): id is PrincipalId => !!id))]
+  if (distinct.length === 0) return new Map()
+  const rows = await db
+    .select({ id: principal.id, displayName: principal.displayName, userName: user.name })
+    .from(principal)
+    .leftJoin(user, eq(user.id, principal.userId))
+    .where(inArray(principal.id, distinct))
+  const names = new Map<string, string>()
+  for (const row of rows) {
+    const name = row.displayName ?? row.userName
+    if (name) names.set(row.id, name)
+  }
+  return names
+}
+
+/** Cap on the `metadata.reason` extracted from thrown errors. */
+const MAX_REASON_LEN = 200
+
+/**
+ * Default retention for audit-log rows. 365 days covers SOC2's
+ * one-year minimum with no extra work for operators. Self-hosters
+ * can override via the `auditLogRetentionDays` field on
+ * `settings.audit_config` (added below). 0 = keep forever.
+ */
+export const DEFAULT_AUDIT_RETENTION_DAYS = 365
+
+/**
+ * Delete audit_log rows older than the configured retention window.
+ * Single SQL DELETE, indexed by occurred_at DESC so the work is
+ * bounded. Returns the number of rows deleted.
+ *
+ * Called from `startup.ts` daily (with a 30s post-boot delay).
+ * Idempotent and concurrency-safe — concurrent runs in the unlikely
+ * event of two pods racing each other simply delete fewer rows in
+ * each.
+ */
+export async function pruneAuditLog(opts?: { retentionDays?: number }): Promise<number> {
+  const retentionDays = opts?.retentionDays ?? DEFAULT_AUDIT_RETENTION_DAYS
+  if (retentionDays <= 0) return 0
+
+  const { db } = await import('@/lib/server/db')
+  const { sql } = await import('drizzle-orm')
+
+  const result = (await db.execute(sql`
+    DELETE FROM "audit_log"
+    WHERE "occurred_at" < now() - ${`${retentionDays} days`}::interval
+  `)) as unknown as { count?: number; length?: number }
+  const deleted = result.count ?? result.length ?? 0
+  if (deleted > 0) {
+    log.info({ deleted_count: deleted, retention_days: retentionDays }, 'pruned audit rows')
+  }
+  return deleted
+}
+
+/**
+ * Derive a stable, length-capped `reason` string from a thrown error.
+ *
+ * Prefers `error.code` (typed Quackback errors like ValidationError /
+ * ForbiddenError set this to a stable identifier). Falls back to a
+ * truncated `error.message` so messages don't leak full backtraces or
+ * unbounded user input into the audit row.
+ */
+function extractReason(error: unknown): string {
+  if (error && typeof error === 'object' && 'code' in error) {
+    return String((error as { code: unknown }).code).slice(0, MAX_REASON_LEN)
+  }
+  if (error instanceof Error) {
+    return error.message.slice(0, MAX_REASON_LEN)
+  }
+  return 'UNEXPECTED'
+}
+
+/**
+ * Wrap a mutation with success/failure audit-log emission. Records a
+ * success row on resolve and a failure row (with `reason` derived from
+ * the error's `code` or message) on throw, then rethrows the original
+ * error.
+ */
+export async function withAuditEvent<T>(
+  spec: {
+    event: AuditEventType
+    actor: AuditActor
+    target?: AuditTarget
+    before?: unknown
+    after?: unknown
+    metadata?: Record<string, unknown>
+    headers?: Headers
+  },
+  mutation: () => Promise<T>
+): Promise<T> {
+  try {
+    const result = await mutation()
+    await recordAuditEvent({
+      event: spec.event,
+      outcome: 'success',
+      actor: spec.actor,
+      target: spec.target,
+      before: spec.before,
+      after: spec.after,
+      metadata: spec.metadata,
+      headers: spec.headers,
+    })
+    return result
+  } catch (error) {
+    await recordAuditEvent({
+      event: spec.event,
+      outcome: 'failure',
+      actor: spec.actor,
+      target: spec.target,
+      before: spec.before,
+      after: spec.after,
+      metadata: { ...(spec.metadata ?? {}), reason: extractReason(error) },
+      headers: spec.headers,
+    })
+    throw error
+  }
+}

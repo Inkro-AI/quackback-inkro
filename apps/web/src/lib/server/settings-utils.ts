@@ -1,0 +1,97 @@
+/**
+ * Settings utilities for fetching branding/logo data.
+ * Simplified for single workspace OSS deployment.
+ *
+ * All images are stored in S3.
+ */
+
+import { absolutizeOffHostAssetUrl } from '@/lib/server/storage/asset-url'
+import { getPublicUrlOrNull } from '@/lib/server/storage/s3'
+
+function offHostPublicUrl(key: string | null | undefined): string | null {
+  const stored = getPublicUrlOrNull(key)
+  return stored ? absolutizeOffHostAssetUrl(stored) : stored
+}
+
+export interface LogoData {
+  url: string | null
+}
+
+export interface BrandingData {
+  name: string
+  logoUrl: string | null
+  faviconUrl: string | null
+  headerLogoUrl: string | null
+  headerDisplayMode: string | null
+  headerDisplayName: string | null
+}
+
+/**
+ * The workspace's settings row, from the settings the request already holds:
+ * every reader here is read-only.
+ */
+async function getSettingsRecord() {
+  const { findSettingsCached } = await import('@/lib/server/domains/settings/settings.helpers')
+  return findSettingsCached()
+}
+
+/**
+ * Get logo data for the settings.
+ */
+export async function getSettingsLogoData(): Promise<LogoData | null> {
+  const record = await getSettingsRecord()
+  if (!record) return null
+
+  const url = offHostPublicUrl(record.logoKey)
+  if (!url) return null
+
+  return { url }
+}
+
+export interface HeaderLogoData {
+  url: string | null
+  displayMode: string | null
+  displayName: string | null
+}
+
+/**
+ * Get favicon data for the settings.
+ */
+export async function getSettingsFaviconData(): Promise<LogoData | null> {
+  const record = await getSettingsRecord()
+  if (!record) return null
+
+  const url = getPublicUrlOrNull(record.faviconKey)
+  if (!url) return null
+
+  return { url }
+}
+
+/**
+ * Get header logo data for the settings.
+ */
+export async function getSettingsHeaderLogoData(): Promise<HeaderLogoData | null> {
+  const record = await getSettingsRecord()
+  if (!record) return null
+  return {
+    url: getPublicUrlOrNull(record.headerLogoKey),
+    displayMode: record.headerDisplayMode,
+    displayName: record.headerDisplayName,
+  }
+}
+
+/**
+ * Get branding data for the settings.
+ */
+export async function getSettingsBrandingData(): Promise<BrandingData | null> {
+  const record = await getSettingsRecord()
+  if (!record) return null
+  return {
+    name: record.name,
+    logoUrl: offHostPublicUrl(record.logoKey),
+    faviconUrl: getPublicUrlOrNull(record.faviconKey),
+    headerLogoUrl: getPublicUrlOrNull(record.headerLogoKey),
+    headerDisplayMode: record.headerDisplayMode,
+    headerDisplayName: record.headerDisplayName,
+  }
+}

@@ -1,0 +1,403 @@
+/**
+ * Portal user detail query
+ *
+ * Fetches a single portal user with their full activity history
+ * (posts authored, commented on, and voted on).
+ */
+
+import {
+  db,
+  eq,
+  and,
+  inArray,
+  isNull,
+  desc,
+  sql,
+  principal,
+  user,
+  session,
+  posts,
+  postComments,
+  postVotes,
+  postStatuses,
+  boards,
+  userSegments,
+  segments,
+  visitorDevices,
+  asc,
+  or,
+  principalRoleAssignments,
+  roles,
+} from '@/lib/server/db'
+import type { PrincipalId, SegmentId } from '@quackback/ids'
+import { InternalError } from '@/lib/shared/errors'
+import { realEmail } from '@/lib/shared/anonymous-email'
+import { truncate } from '@/lib/shared/utils/string'
+import { logger } from '@/lib/server/logger'
+import { resolveUserAvatarUrl } from '@/lib/server/domains/principals/principal-display'
+import { hasSignedInSql } from '@/lib/server/domains/principals/team-promotion'
+import { presetForLegacyRole } from '@/lib/shared/permissions'
+import { notTestPrincipal } from '@/lib/server/test-data'
+
+const log = logger.child({ component: 'user-detail' })
+import type {
+  PortalUserDetail,
+  PersonTeamRole,
+  EngagedPost,
+  EngagementType,
+  UserSegmentSummary,
+} from './user.types'
+
+// ---------------------------------------------------------------------------
+// Internal helper: batch-fetch segments for a set of principal IDs
+// ---------------------------------------------------------------------------
+
+async function fetchSegmentsForUser(
+  principalIds: string[]
+): Promise<Map<string, UserSegmentSummary[]>> {
+  if (principalIds.length === 0) return new Map()
+
+  const rows = await db
+    .select({
+      principalId: userSegments.principalId,
+      segmentId: segments.id,
+      segmentName: segments.name,
+      segmentColor: segments.color,
+      segmentType: segments.type,
+    })
+    .from(userSegments)
+    .innerJoin(segments, eq(userSegments.segmentId, segments.id))
+    .where(
+      and(
+        inArray(userSegments.principalId, principalIds as PrincipalId[]),
+        isNull(segments.deletedAt)
+      )
+    )
+    .orderBy(asc(segments.name))
+
+  const map = new Map<string, UserSegmentSummary[]>()
+  for (const row of rows) {
+    if (!map.has(row.principalId)) map.set(row.principalId, [])
+    map.get(row.principalId)!.push({
+      id: row.segmentId as SegmentId,
+      name: row.segmentName,
+      color: row.segmentColor,
+      type: row.segmentType as 'manual' | 'dynamic',
+    })
+  }
+  return map
+}
+
+/**
+ * A teammate's tier plus the workspace-wide grant when it is not the tier's
+ * default preset (a custom role, or a different system role).
+ */
+async function resolveTeamRole(
+  principalId: PrincipalId,
+  role: string
+): Promise<PersonTeamRole | null> {
+  if (role !== 'admin' && role !== 'member') return null
+  const [assigned] = await db
+    .select({ id: roles.id, key: roles.key, name: roles.name })
+    .from(principalRoleAssignments)
+    .innerJoin(roles, eq(roles.id, principalRoleAssignments.roleId))
+    .where(
+      and(
+        eq(principalRoleAssignments.principalId, principalId),
+        isNull(principalRoleAssignments.teamId)
+      )
+    )
+    .limit(1)
+  if (!assigned || assigned.key === presetForLegacyRole(role)) return { role }
+  return { role, roleId: assigned.id, roleName: assigned.name }
+}
+
+// ---------------------------------------------------------------------------
+// Public function
+// ---------------------------------------------------------------------------
+
+/**
+ * Get detailed information about a portal user including their activity.
+ *
+ * Returns user info and all posts they've engaged with (authored, commented on, or voted on).
+ */
+export async function getPortalUserDetail(
+  principalId: PrincipalId,
+  opts?: {
+    /** Also find identified teammates (the admin people page shows a person after they join the team). */
+    includeTeammates?: boolean
+  }
+): Promise<PortalUserDetail | null> {
+  try {
+    // Portal users (role='user'); with includeTeammates also human teammates,
+    // never Cloud support or service principals.
+    const roleWhere = opts?.includeTeammates
+      ? or(
+          eq(principal.role, 'user'),
+          and(inArray(principal.role, ['admin', 'member']), eq(principal.type, 'user'))
+        )!
+      : eq(principal.role, 'user')
+    const principalResult = await db
+      .select({
+        principalId: principal.id,
+        userId: user.id,
+        name: user.name,
+        email: user.email,
+        image: user.image,
+        imageKey: user.imageKey,
+        emailVerified: user.emailVerified,
+        metadata: user.metadata,
+        principalType: principal.type,
+        role: principal.role,
+        hasSignedIn: hasSignedInSql(),
+        contactEmail: principal.contactEmail,
+        country: user.country,
+        joinedAt: principal.createdAt,
+        createdAt: user.createdAt,
+      })
+      .from(principal)
+      .innerJoin(user, eq(principal.userId, user.id))
+      .where(and(eq(principal.id, principalId), roleWhere, notTestPrincipal(principal.id)))
+      .limit(1)
+
+    if (principalResult.length === 0) {
+      return null
+    }
+
+    const principalData = principalResult[0]
+    const realPost = and(isNull(posts.deletedAt), notTestPrincipal(posts.principalId))
+
+    // Run independent queries in parallel for better performance
+    const [authoredPosts, commentedPostIds, votedPostIds] = await Promise.all([
+      // Get posts authored by this user (via principalId)
+      db
+        .select({
+          id: posts.id,
+          title: posts.title,
+          content: posts.content,
+          statusId: posts.statusId,
+          voteCount: posts.voteCount,
+          createdAt: posts.createdAt,
+          authorName: sql<string | null>`(
+            SELECT m.display_name FROM ${principal} m
+            WHERE m.id = ${posts.principalId}
+          )`.as('author_name'),
+          boardSlug: boards.slug,
+          boardName: boards.name,
+          statusName: postStatuses.name,
+          statusColor: postStatuses.color,
+        })
+        .from(posts)
+        .innerJoin(boards, eq(posts.boardId, boards.id))
+        .leftJoin(postStatuses, eq(postStatuses.id, posts.statusId))
+        .where(and(eq(posts.principalId, principalData.principalId), realPost))
+        .orderBy(desc(posts.createdAt))
+        .limit(100),
+
+      // Get post IDs the user has commented on (via principalId)
+      db
+        .select({
+          postId: postComments.postId,
+          latestCommentAt: sql<Date>`max(${postComments.createdAt})`.as('latest_comment_at'),
+        })
+        .from(postComments)
+        .innerJoin(posts, eq(posts.id, postComments.postId))
+        .where(and(eq(postComments.principalId, principalData.principalId), realPost))
+        .groupBy(postComments.postId)
+        .limit(100),
+
+      // Get post IDs the user has voted on (via indexed principalId column)
+      db
+        .select({
+          postId: postVotes.postId,
+          votedAt: postVotes.createdAt,
+        })
+        .from(postVotes)
+        .innerJoin(posts, eq(posts.id, postVotes.postId))
+        .where(and(eq(postVotes.principalId, principalData.principalId), realPost))
+        .orderBy(desc(postVotes.createdAt))
+        .limit(100),
+    ])
+
+    // Collect all unique post IDs that aren't authored by user (for fetching additional posts)
+    const authoredIds = new Set(authoredPosts.map((p) => p.id))
+    const otherPostIds = [
+      ...new Set([
+        ...commentedPostIds.map((c) => c.postId).filter((id) => !authoredIds.has(id)),
+        ...votedPostIds.map((v) => v.postId).filter((id) => !authoredIds.has(id)),
+      ]),
+    ]
+
+    // Run all dependent queries in parallel — otherPostCommentCounts uses
+    // otherPostIds (available now) instead of waiting for otherPosts results
+    const allCommentPostIds = [...authoredPosts.map((p) => p.id), ...otherPostIds]
+    const [otherPosts, commentCounts] = await Promise.all([
+      otherPostIds.length > 0
+        ? db
+            .select({
+              id: posts.id,
+              title: posts.title,
+              content: posts.content,
+              statusId: posts.statusId,
+              voteCount: posts.voteCount,
+              createdAt: posts.createdAt,
+              authorName: sql<string | null>`(
+                SELECT m.display_name FROM ${principal} m
+                WHERE m.id = ${posts.principalId}
+              )`.as('author_name'),
+              boardSlug: boards.slug,
+              boardName: boards.name,
+              statusName: postStatuses.name,
+              statusColor: postStatuses.color,
+            })
+            .from(posts)
+            .innerJoin(boards, eq(posts.boardId, boards.id))
+            .leftJoin(postStatuses, eq(postStatuses.id, posts.statusId))
+            .where(and(inArray(posts.id, otherPostIds), realPost))
+        : [],
+
+      // Get comment counts for all engaged posts in one query
+      allCommentPostIds.length > 0
+        ? db
+            .select({
+              postId: postComments.postId,
+              count: sql<number>`count(*)::int`.as('count'),
+            })
+            .from(postComments)
+            .where(
+              and(
+                inArray(postComments.postId, allCommentPostIds),
+                isNull(postComments.deletedAt),
+                notTestPrincipal(postComments.principalId)
+              )
+            )
+            .groupBy(postComments.postId)
+        : [],
+    ])
+
+    const engagementData = {
+      authoredPosts,
+      commentedPostIds,
+      votedPostIds,
+      otherPosts,
+      commentCounts,
+    }
+
+    // Build maps for engagement tracking
+    const commentedPostMap = new Map(
+      engagementData.commentedPostIds.map((c) => [c.postId, c.latestCommentAt])
+    )
+    const votedPostMap = new Map(engagementData.votedPostIds.map((v) => [v.postId, v.votedAt]))
+    const commentCountMap = new Map(
+      engagementData.commentCounts.map((c) => [c.postId, Number(c.count)])
+    )
+
+    // Combine all posts into a single engaged posts list
+    const allPosts = [...engagementData.authoredPosts, ...engagementData.otherPosts]
+    const authoredPostIds = new Set(engagementData.authoredPosts.map((p) => p.id))
+    const engagedPostsMap = new Map<string, EngagedPost>()
+
+    for (const post of allPosts) {
+      const engagementTypes: EngagementType[] = []
+      const engagementDates: Date[] = []
+
+      if (authoredPostIds.has(post.id)) {
+        engagementTypes.push('authored')
+        engagementDates.push(post.createdAt)
+      }
+
+      const commentDate = commentedPostMap.get(post.id)
+      if (commentDate) {
+        engagementTypes.push('commented')
+        engagementDates.push(new Date(commentDate))
+      }
+
+      const voteDate = votedPostMap.get(post.id)
+      if (voteDate) {
+        engagementTypes.push('voted')
+        engagementDates.push(new Date(voteDate))
+      }
+
+      if (engagementTypes.length > 0) {
+        const contentPreview = truncate(post.content, 200)
+
+        engagedPostsMap.set(post.id, {
+          id: post.id,
+          title: post.title,
+          content: contentPreview,
+          statusId: post.statusId,
+          statusName: post.statusName,
+          statusColor: post.statusColor ?? '#6b7280',
+          voteCount: post.voteCount,
+          commentCount: commentCountMap.get(post.id) ?? 0,
+          boardSlug: post.boardSlug,
+          boardName: post.boardName,
+          authorName: post.authorName,
+          createdAt: post.createdAt,
+          engagementTypes,
+          engagedAt: new Date(Math.max(...engagementDates.map((d) => d.getTime()))),
+        })
+      }
+    }
+
+    // Sort by most recent engagement
+    const engagedPosts = Array.from(engagedPostsMap.values()).sort(
+      (a, b) => b.engagedAt.getTime() - a.engagedAt.getTime()
+    )
+
+    const postCount = engagementData.authoredPosts.length
+    const commentCount = engagementData.commentedPostIds.length
+    const voteCount = engagementData.votedPostIds.length
+
+    const teamRole = await resolveTeamRole(principalData.principalId, principalData.role)
+    const segmentMap = await fetchSegmentsForUser([principalData.principalId])
+    const userSegmentList = segmentMap.get(principalData.principalId) ?? []
+
+    // Freshest activity signal: session touch or device beacon (layer 2).
+    const [[sessionSeen], [deviceSeen]] = await Promise.all([
+      db
+        .select({ v: sql<Date | null>`max(${session.updatedAt})` })
+        .from(session)
+        .where(eq(session.userId, principalData.userId)),
+      db
+        .select({ v: sql<Date | null>`max(${visitorDevices.lastSeenAt})` })
+        .from(visitorDevices)
+        .where(eq(visitorDevices.principalId, principalData.principalId)),
+    ])
+    const seenDates = [sessionSeen?.v, deviceSeen?.v]
+      .filter((d): d is Date => d != null)
+      .map((d) => new Date(d))
+    const lastSeenAt =
+      seenDates.length > 0 ? new Date(Math.max(...seenDates.map((d) => d.getTime()))) : null
+
+    return {
+      principalId: principalData.principalId,
+      userId: principalData.userId,
+      name: principalData.name,
+      // Synthetic anon placeholder must never surface (agent inbox, v1 API).
+      email: realEmail(principalData.email),
+      image: resolveUserAvatarUrl({
+        userImage: principalData.image,
+        userImageKey: principalData.imageKey,
+      }),
+      emailVerified: principalData.emailVerified,
+      metadata: principalData.metadata,
+      isLead: principalData.principalType === 'anonymous',
+      contactEmail: realEmail(principalData.contactEmail),
+      country: principalData.country,
+      joinedAt: principalData.joinedAt,
+      lastSeenAt,
+      createdAt: principalData.createdAt,
+      postCount,
+      commentCount,
+      voteCount,
+      engagedPosts,
+      segments: userSegmentList,
+      teamRole,
+      hasSignedIn: Boolean(principalData.hasSignedIn),
+    }
+  } catch (error) {
+    log.error({ err: error }, 'failed to get portal user detail')
+    throw new InternalError('DATABASE_ERROR', 'Failed to get portal user detail', error)
+  }
+}

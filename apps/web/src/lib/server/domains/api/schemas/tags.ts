@@ -1,0 +1,216 @@
+/**
+ * Tags API Schema Registrations
+ */
+import 'zod-openapi'
+import { z } from 'zod'
+import {
+  registerPath,
+  TypeIdSchema,
+  createItemResponseSchema,
+  createPaginatedResponseSchema,
+  asSchema,
+} from '../openapi'
+import {
+  TimestampSchema,
+  HexColorSchema,
+  UnauthorizedErrorSchema,
+  NotFoundErrorSchema,
+  ValidationErrorSchema,
+} from './common'
+
+// PostTag schema
+const IsPublicSchema = z.boolean().meta({
+  description:
+    'Whether customers can see this tag on the public portal. False keeps the tag internal to your team.',
+  example: true,
+})
+
+const TagSchema = z.object({
+  id: TypeIdSchema.meta({ example: 'post_tag_01h455vb4pex5vsknk084sn02q' }),
+  name: z.string().meta({ example: 'Bug' }),
+  color: HexColorSchema.meta({ example: '#ef4444' }),
+  isPublic: IsPublicSchema,
+  createdAt: TimestampSchema,
+})
+
+// Request body schemas
+const CreateTagSchema = z
+  .object({
+    name: z.string().min(1).max(50).meta({ description: 'PostTag name', example: 'Bug' }),
+    color: HexColorSchema.optional().meta({ description: 'PostTag color', default: '#6b7280' }),
+    isPublic: IsPublicSchema.optional().meta({ default: true }),
+  })
+  .meta({ description: 'Create tag request body' })
+
+const UpdateTagSchema = z
+  .object({
+    name: z.string().min(1).max(50).optional(),
+    color: HexColorSchema.optional(),
+    isPublic: IsPublicSchema.optional(),
+  })
+  .meta({ description: 'Update tag request body' })
+
+// Register GET /tags
+registerPath('/tags', {
+  get: {
+    tags: ['Tags'],
+    summary: 'List tags',
+    description: 'Returns all tags in the workspace',
+    responses: {
+      200: {
+        description: 'List of tags',
+        content: {
+          'application/json': {
+            schema: createPaginatedResponseSchema(TagSchema, 'List of tags'),
+          },
+        },
+      },
+      401: {
+        description: 'Unauthorized',
+        content: { 'application/json': { schema: UnauthorizedErrorSchema } },
+      },
+    },
+  },
+})
+
+// Register POST /tags
+registerPath('/tags', {
+  post: {
+    tags: ['Tags'],
+    summary: 'Create a tag',
+    description: 'Create a new tag',
+    requestBody: {
+      required: true,
+      content: {
+        'application/json': {
+          schema: asSchema(CreateTagSchema),
+        },
+      },
+    },
+    responses: {
+      201: {
+        description: 'PostTag created',
+        content: {
+          'application/json': { schema: createItemResponseSchema(TagSchema, 'Created tag') },
+        },
+      },
+      400: {
+        description: 'Validation error',
+        content: { 'application/json': { schema: ValidationErrorSchema } },
+      },
+      401: {
+        description: 'Unauthorized',
+        content: { 'application/json': { schema: UnauthorizedErrorSchema } },
+      },
+    },
+  },
+})
+
+// Register GET /tags/{tagId}
+registerPath('/tags/{tagId}', {
+  get: {
+    tags: ['Tags'],
+    summary: 'Get a tag',
+    description: 'Get a single tag by ID',
+    parameters: [
+      {
+        name: 'tagId',
+        in: 'path',
+        required: true,
+        schema: { type: 'string' },
+        description: 'PostTag ID',
+      },
+    ],
+    responses: {
+      200: {
+        description: 'PostTag details',
+        content: {
+          'application/json': { schema: createItemResponseSchema(TagSchema, 'PostTag details') },
+        },
+      },
+      401: {
+        description: 'Unauthorized',
+        content: { 'application/json': { schema: UnauthorizedErrorSchema } },
+      },
+      404: {
+        description: 'PostTag not found',
+        content: { 'application/json': { schema: NotFoundErrorSchema } },
+      },
+    },
+  },
+})
+
+// Register PATCH /tags/{tagId}
+registerPath('/tags/{tagId}', {
+  patch: {
+    tags: ['Tags'],
+    summary: 'Update a tag',
+    description: 'Update an existing tag',
+    parameters: [
+      {
+        name: 'tagId',
+        in: 'path',
+        required: true,
+        schema: { type: 'string' },
+        description: 'PostTag ID',
+      },
+    ],
+    requestBody: {
+      required: true,
+      content: {
+        'application/json': {
+          schema: asSchema(UpdateTagSchema),
+        },
+      },
+    },
+    responses: {
+      200: {
+        description: 'PostTag updated',
+        content: {
+          'application/json': { schema: createItemResponseSchema(TagSchema, 'Updated tag') },
+        },
+      },
+      400: {
+        description: 'Validation error',
+        content: { 'application/json': { schema: ValidationErrorSchema } },
+      },
+      401: {
+        description: 'Unauthorized',
+        content: { 'application/json': { schema: UnauthorizedErrorSchema } },
+      },
+      404: {
+        description: 'PostTag not found',
+        content: { 'application/json': { schema: NotFoundErrorSchema } },
+      },
+    },
+  },
+})
+
+// Register DELETE /tags/{tagId}
+registerPath('/tags/{tagId}', {
+  delete: {
+    tags: ['Tags'],
+    summary: 'Delete a tag',
+    description: 'Delete a tag by ID',
+    parameters: [
+      {
+        name: 'tagId',
+        in: 'path',
+        required: true,
+        schema: { type: 'string' },
+        description: 'PostTag ID',
+      },
+    ],
+    responses: {
+      204: { description: 'PostTag deleted' },
+      401: {
+        description: 'Unauthorized',
+        content: { 'application/json': { schema: UnauthorizedErrorSchema } },
+      },
+      404: {
+        description: 'PostTag not found',
+        content: { 'application/json': { schema: NotFoundErrorSchema } },
+      },
+    },
+  },
+})

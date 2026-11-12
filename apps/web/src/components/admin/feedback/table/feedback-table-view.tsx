@@ -1,0 +1,338 @@
+import { useCallback, useEffect, type ReactNode } from 'react'
+import { useInfiniteScroll } from '@/lib/client/hooks/use-infinite-scroll'
+import { useDebouncedSearch } from '@/lib/client/hooks/use-debounced-search'
+import { Spinner } from '@/components/shared/spinner'
+import { Button } from '@/components/ui/button'
+import { Skeleton } from '@/components/ui/skeleton'
+import { AdminListHeader } from '@/components/admin/admin-list-header'
+import { InboxEmptyState } from '@/components/admin/feedback/inbox-empty-state'
+import { ActiveFiltersBar, AddFilterButton } from '@/components/admin/feedback/active-filters-bar'
+import { FeedbackRow } from './feedback-row'
+import type { PostListItem, PostStatusEntity, Board, PostTag } from '@/lib/shared/db-types'
+import type { TeamMember } from '@/lib/shared/types'
+import type { SegmentListItem } from '@/lib/client/hooks/use-segments-queries'
+import type { InboxFilters } from '@/components/admin/feedback/use-inbox-filters'
+import type { WidenedSearch } from '@/lib/shared/types/filters'
+import type { PostId } from '@quackback/ids'
+
+interface FeedbackTableViewProps {
+  posts: PostListItem[]
+  statuses: PostStatusEntity[]
+  boards: Board[]
+  tags: PostTag[]
+  members: TeamMember[]
+  segments?: SegmentListItem[]
+  filters: InboxFilters
+  onFiltersChange: (updates: Partial<InboxFilters>) => void
+  hasMore: boolean
+  isLoading: boolean
+  isLoadingMore: boolean
+  /** Opens a post from its row; keep it stable, or every row renders again. */
+  onNavigateToPost: (id: string) => void
+  onLoadMore: () => void
+  hasActiveFilters: boolean
+  onClearFilters: () => void
+  /** Extra controls after the Filter control (e.g. saved views) */
+  headerFilters?: React.ReactNode
+  /** The primary action, on the right of the toolbar */
+  headerAction?: React.ReactNode
+  onToggleStatus: (slug: string) => void
+  onToggleBoard: (id: string) => void
+  onToggleSegment?: (id: string) => void
+  /** Duplicate counts per post (for badges) */
+  duplicateCountByPostId?: Map<PostId, number>
+  /** Set when no post matched every word of the search and it was widened. */
+  searchMode?: WidenedSearch
+}
+
+const SORT_OPTIONS = [
+  { value: 'newest', label: 'Newest' },
+  { value: 'oldest', label: 'Oldest' },
+  { value: 'votes', label: 'Top votes' },
+  { value: 'priority', label: 'Priority' },
+]
+
+/** Best match leads the options while searching; it has nothing to rank otherwise. */
+const SEARCH_SORT_OPTIONS = [{ value: 'relevance', label: 'Best match' }, ...SORT_OPTIONS]
+
+const WIDENED_SEARCH_NOTES: Record<WidenedSearch, string> = {
+  most: 'No post has all your words. Showing posts with most of them.',
+  similar: 'No exact matches. Showing posts with a similar spelling.',
+}
+
+interface FeedbackListHeaderProps {
+  search: string | undefined
+  sort: InboxFilters['sort']
+  onFiltersChange: (updates: Partial<InboxFilters>) => void
+  filters?: ReactNode
+  action?: ReactNode
+  children?: ReactNode
+}
+
+/**
+ * The search box's text lives here, so a keystroke renders the header and not
+ * the list below it; the debounced value reaches the URL through the filters.
+ */
+function FeedbackListHeader({
+  search,
+  sort,
+  onFiltersChange,
+  filters,
+  action,
+  children,
+}: FeedbackListHeaderProps) {
+  const handleSortChange = useCallback(
+    (value: string) => onFiltersChange({ sort: value as InboxFilters['sort'] }),
+    [onFiltersChange]
+  )
+  const { value: searchValue, setValue: setSearchValue } = useDebouncedSearch({
+    externalValue: search,
+    onChange: (next) => onFiltersChange({ search: next }),
+  })
+
+  return (
+    <AdminListHeader
+      searchValue={searchValue}
+      onSearchChange={setSearchValue}
+      searchPlaceholder="Search posts..."
+      sortOptions={search ? SEARCH_SORT_OPTIONS : SORT_OPTIONS}
+      activeSort={sort === 'relevance' && !search ? 'newest' : sort}
+      onSortChange={handleSortChange}
+      filters={filters}
+      action={action}
+    >
+      {children}
+    </AdminListHeader>
+  )
+}
+
+function TableSkeleton() {
+  return (
+    <div className="p-3">
+      <div className="overflow-hidden divide-y divide-border/50 border-y border-t-transparent border-border/50">
+        {Array.from({ length: 6 }).map((_, rowIdx) => (
+          <div key={rowIdx} className="flex py-1 px-3">
+            {/* Vote button */}
+            <Skeleton className="w-13 h-14 rounded-lg shrink-0 self-center mx-3" />
+            {/* Content */}
+            <div className="flex-1 min-w-0 px-3 py-2.5">
+              {/* Status badge */}
+              <Skeleton className="h-5 w-16 rounded-full mb-1" />
+              {/* Title */}
+              <Skeleton className="h-4 w-3/4 mb-1" />
+              {/* Description */}
+              <Skeleton className="h-3 w-full mb-1.5" />
+              {/* Tags */}
+              <div className="flex items-center gap-1 mb-1.5">
+                <Skeleton className="h-4 w-12 rounded-full" />
+                <Skeleton className="h-4 w-14 rounded-full" />
+              </div>
+              {/* Meta row: author · time · comments · board */}
+              <div className="flex items-center gap-2">
+                <Skeleton className="h-3 w-16" />
+                <Skeleton className="h-3 w-14" />
+                <Skeleton className="h-3 w-10" />
+                <Skeleton className="h-3 w-16" />
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+export function FeedbackTableView({
+  posts,
+  statuses,
+  boards,
+  tags,
+  members,
+  segments,
+  filters,
+  onFiltersChange,
+  hasMore,
+  isLoading,
+  isLoadingMore,
+  onNavigateToPost,
+  onLoadMore,
+  hasActiveFilters,
+  onClearFilters,
+  headerFilters,
+  headerAction,
+  onToggleStatus,
+  onToggleBoard,
+  duplicateCountByPostId,
+  onToggleSegment,
+  searchMode,
+}: FeedbackTableViewProps): React.ReactElement {
+  const loadMoreRef = useInfiniteScroll({
+    hasMore,
+    isFetching: isLoading || isLoadingMore,
+    onLoadMore,
+    rootMargin: '0px',
+    threshold: 0.1,
+  })
+
+  // Keyboard navigation
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      // Ignore if in input/textarea/contenteditable
+      const target = e.target as HTMLElement
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target.isContentEditable
+      ) {
+        if (e.key === 'Escape') {
+          target.blur()
+        }
+        return
+      }
+
+      switch (e.key) {
+        case '/':
+          e.preventDefault()
+          document.querySelector<HTMLInputElement>('[data-search-input]')?.focus()
+          break
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [])
+
+  const headerContent = (
+    <FeedbackListHeader
+      search={filters.search}
+      sort={filters.sort}
+      onFiltersChange={onFiltersChange}
+      filters={
+        <>
+          <AddFilterButton
+            filters={filters}
+            boards={boards}
+            tags={tags}
+            statuses={statuses}
+            members={members}
+            segments={segments}
+            onToggleStatus={onToggleStatus}
+            onToggleBoard={onToggleBoard}
+            onToggleSegment={onToggleSegment}
+            onFiltersChange={onFiltersChange}
+          />
+          {headerFilters}
+        </>
+      }
+      action={headerAction}
+    >
+      <ActiveFiltersBar
+        filters={filters}
+        onFiltersChange={onFiltersChange}
+        onClearAll={onClearFilters}
+        boards={boards}
+        tags={tags}
+        statuses={statuses}
+        members={members}
+        segments={segments}
+      />
+    </FeedbackListHeader>
+  )
+
+  // Filter posts by duplicates if active
+  const filteredPosts =
+    filters.hasDuplicates && duplicateCountByPostId
+      ? posts.filter((p) => (duplicateCountByPostId.get(p.id) ?? 0) > 0)
+      : posts
+  const isSearchingForDuplicateMatches =
+    !!filters.hasDuplicates && filteredPosts.length === 0 && (hasMore || isLoadingMore)
+
+  useEffect(() => {
+    if (isSearchingForDuplicateMatches && !isLoading && !isLoadingMore) {
+      onLoadMore()
+    }
+  }, [isSearchingForDuplicateMatches, isLoading, isLoadingMore, onLoadMore])
+
+  if (isLoading) {
+    return (
+      <div className="max-w-5xl w-full">
+        {headerContent}
+        <TableSkeleton />
+      </div>
+    )
+  }
+
+  if (filteredPosts.length === 0 && !isSearchingForDuplicateMatches) {
+    return (
+      <div className="max-w-5xl w-full">
+        {headerContent}
+        <InboxEmptyState
+          type={hasActiveFilters ? 'no-results' : 'no-posts'}
+          onClearFilters={hasActiveFilters ? onClearFilters : undefined}
+        />
+      </div>
+    )
+  }
+
+  if (isSearchingForDuplicateMatches) {
+    return (
+      <div className="max-w-5xl w-full">
+        {headerContent}
+        <div className="px-3 py-12 flex flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+          <Spinner />
+          <p>Searching for posts with duplicate suggestions…</p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="max-w-5xl w-full">
+      {headerContent}
+
+      {searchMode && (
+        <p className="px-6 pt-3 text-sm text-muted-foreground">
+          {WIDENED_SEARCH_NOTES[searchMode]}
+        </p>
+      )}
+
+      {/* Post List */}
+      <div className="p-3">
+        <div className="overflow-hidden divide-y divide-border/50 border-y border-t-transparent border-border/50">
+          {filteredPosts.map((post, index) => (
+            <div
+              key={post.id}
+              className="animate-in fade-in slide-in-from-bottom-1 duration-200 fill-mode-backwards"
+              style={{ animationDelay: `${Math.min(index * 30, 150)}ms` }}
+            >
+              <FeedbackRow
+                post={post}
+                statuses={statuses}
+                duplicateCount={duplicateCountByPostId?.get(post.id)}
+                onOpen={onNavigateToPost}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Load more trigger */}
+      {hasMore && (
+        <div ref={loadMoreRef} className="px-3 pb-3 flex justify-center">
+          {isLoadingMore ? (
+            <Spinner />
+          ) : (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={onLoadMore}
+              className="text-muted-foreground"
+            >
+              Load more
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}

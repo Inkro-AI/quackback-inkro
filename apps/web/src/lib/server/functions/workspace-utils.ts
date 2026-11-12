@@ -1,0 +1,114 @@
+/**
+ * Workspace auth for route loaders (beforeLoad).
+ *
+ * These throw redirect() for unauthenticated users, making them suitable
+ * for route guards. For server functions, use requireAuth() from auth-helpers.ts.
+ */
+
+import { createServerFn } from '@tanstack/react-start'
+import { redirect } from '@tanstack/react-router'
+import { z } from 'zod'
+import type { UserId } from '@quackback/ids'
+import { getSession } from '@/lib/server/auth/session'
+import { getRequestPermissions, getRequestPrincipal } from '@/lib/server/auth/request-session'
+import { findSettingsCached } from '@/lib/server/domains/settings/settings.helpers'
+import { isTeamMember } from '@/lib/shared/roles'
+import { logger } from '@/lib/server/logger'
+import { buildSigninRedirect, teamSigninCallback } from '@/lib/shared/auth-prompt'
+import { ALL_PERMISSIONS, type PermissionKey } from '@/lib/shared/permissions'
+
+const log = logger.child({ component: 'workspace-utils' })
+
+const requireWorkspaceRoleSchema = z.object({
+  allowedRoles: z.array(z.string()),
+  /**
+   * Additionally require this permission from the caller's resolved
+   * (assignment-derived) set. Admin-area pages gate on `allowedRoles:
+   * ['admin', 'member']` (the teammate wall) plus the permission their server
+   * functions actually enforce, so a custom role holding the page's
+   * capability can reach the page.
+   */
+  permission: z
+    .string()
+    .refine((v) => (ALL_PERMISSIONS as readonly string[]).includes(v), 'Unknown permission key')
+    .optional(),
+  /**
+   * The page the caller was opening (path, query and hash). A signed-out or
+   * wrong-account caller is sent to sign-in with this as the destination, so
+   * a deep link survives the round trip. Only a same-origin team path is
+   * kept; anything else falls back to `/admin`.
+   */
+  callbackUrl: z.string().max(2048).optional(),
+})
+
+/**
+ * Route guard: require authenticated user with specific workspace role, and
+ * optionally a resolved permission.
+ * Unauthenticated callers on team-only routes are sent to the portal
+ * sign-in dialog carrying the page they were opening (`callbackUrl`, else
+ * `/admin`). Callers on routes that also
+ * allow role='user' (public portal) fall back to '/'.
+ *
+ * Returns only the caller's own identity. The browser picks `allowedRoles`,
+ * so any signed-in visitor can reach the return statement.
+ *
+ * Use in route beforeLoad:
+ * @example
+ * beforeLoad: async () => {
+ *   const { user, member } = await requireWorkspaceRole({
+ *     data: { allowedRoles: ['admin', 'member'], permission: PERMISSIONS.SETTINGS_MANAGE }
+ *   })
+ *   return { user, member }
+ * }
+ */
+export const requireWorkspaceRole = createServerFn({ method: 'GET' })
+  .validator(requireWorkspaceRoleSchema)
+  .handler(async ({ data }) => {
+    log.debug({ allowed_roles: data.allowedRoles }, 'require workspace role')
+    // Team-only routes send unauthenticated callers to the sign-in dialog
+    // with the page they asked for as the destination. Routes that also allow
+    // role='user' (public portal) fall back to '/' for the regular sign-in flow.
+    const teamOnly = data.allowedRoles.every(isTeamMember)
+    const destination = teamSigninCallback(data.callbackUrl)
+    const unauthRedirect = teamOnly ? buildSigninRedirect(destination) : { to: '/' as const }
+    const session = await getSession()
+    if (!session?.user) {
+      throw redirect(unauthRedirect)
+    }
+
+    // The settings, principal and permission reads are the request's own
+    // (request-session.ts), shared with the session read above and with every
+    // server function the page runs in the same request.
+    const appSettings = await findSettingsCached()
+    if (!appSettings) {
+      throw redirect({ to: '/' })
+    }
+
+    // Note: Onboarding check is handled in __root.tsx beforeLoad
+
+    const principalRecord = await getRequestPrincipal(session.user.id as UserId)
+    if (!principalRecord) {
+      throw redirect(unauthRedirect)
+    }
+
+    if (!data.allowedRoles.includes(principalRecord.role)) {
+      throw redirect(buildSigninRedirect(destination, { error: 'not_team_member' }))
+    }
+
+    // Team routes and permission-gated routes only accept dashboard sessions.
+    if ((teamOnly || data.permission) && session.session.scope !== 'dashboard') {
+      throw redirect(buildSigninRedirect(destination, { error: 'not_team_member' }))
+    }
+
+    const resolvedPermissions = await getRequestPermissions(principalRecord)
+
+    if (data.permission && !resolvedPermissions.has(data.permission as PermissionKey)) {
+      throw redirect(buildSigninRedirect(destination, { error: 'not_team_member' }))
+    }
+
+    return {
+      principal: principalRecord,
+      user: session.user,
+      permissions: [...resolvedPermissions],
+    }
+  })

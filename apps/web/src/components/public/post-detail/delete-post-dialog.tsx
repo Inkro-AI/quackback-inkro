@@ -1,0 +1,201 @@
+'use client'
+
+import { useState, useEffect } from 'react'
+import { useIntl } from 'react-intl'
+import { ConfirmDialog } from '@/components/shared/confirm-dialog'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Label } from '@/components/ui/label'
+import { INTEGRATION_ICON_MAP } from '@/components/icons/integration-icons'
+import {
+  getIntegrationActionVerb,
+  getIntegrationDisplayName,
+  getIntegrationItemNoun,
+  formatExternalId,
+} from '@/components/admin/settings/integrations/integration-ui'
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export interface ExternalLinkInfo {
+  id: string
+  integrationType: string
+  externalId: string
+  externalDisplayId: string | null
+  externalUrl: string | null
+  integrationActive: boolean
+  syncManaged: boolean
+  onDeleteDefault: 'archive' | 'nothing'
+}
+
+export interface CascadeChoice {
+  linkId: string
+  shouldArchive: boolean
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/** Get the best display ID available */
+function getDisplayId(link: ExternalLinkInfo): string {
+  if (link.externalDisplayId) return formatExternalId(link.integrationType, link.externalDisplayId)
+  return formatExternalId(link.integrationType, link.externalId)
+}
+
+// ============================================================================
+// Component
+// ============================================================================
+
+interface DeletePostDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  postTitle: string
+  onConfirm: (cascadeChoices: CascadeChoice[]) => void
+  isPending: boolean
+  /** Override the default description text */
+  description?: React.ReactNode
+  /** External links for cascade delete checkboxes */
+  externalLinks?: ExternalLinkInfo[]
+  /** Whether external links are still loading */
+  isLoadingLinks?: boolean
+  /** Whether external links failed to load */
+  isErrorLinks?: boolean
+}
+
+export function DeletePostDialog({
+  open,
+  onOpenChange,
+  postTitle,
+  onConfirm,
+  isPending,
+  description,
+  externalLinks,
+  isLoadingLinks,
+  isErrorLinks,
+}: DeletePostDialogProps) {
+  const intl = useIntl()
+  const [choices, setChoices] = useState<Record<string, boolean>>({})
+
+  // Reset choices when dialog opens with new links
+  useEffect(() => {
+    if (open && externalLinks) {
+      const defaults: Record<string, boolean> = {}
+      for (const link of externalLinks) {
+        defaults[link.id] =
+          link.integrationActive && link.syncManaged && link.onDeleteDefault === 'archive'
+      }
+      setChoices(defaults)
+    }
+  }, [open, externalLinks])
+
+  const handleConfirm = () => {
+    const cascadeChoices: CascadeChoice[] = (externalLinks ?? []).map((link) => ({
+      linkId: link.id,
+      shouldArchive: choices[link.id] ?? false,
+    }))
+    onConfirm(cascadeChoices)
+  }
+
+  const hasLinks = externalLinks && externalLinks.length > 0
+
+  return (
+    <ConfirmDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title={intl.formatMessage({
+        id: 'portal.postDetail.deleteDialog.title',
+        defaultMessage: 'Delete post',
+      })}
+      description={
+        description ??
+        intl.formatMessage(
+          {
+            id: 'portal.postDetail.deleteDialog.description',
+            defaultMessage:
+              'Are you sure you want to delete "{title}"? This action cannot be undone.',
+          },
+          { title: postTitle }
+        )
+      }
+      variant="destructive"
+      confirmLabel={
+        isPending
+          ? intl.formatMessage({
+              id: 'portal.postDetail.deleteDialog.deleting',
+              defaultMessage: 'Deleting...',
+            })
+          : isLoadingLinks
+            ? intl.formatMessage({
+                id: 'portal.postDetail.deleteDialog.loading',
+                defaultMessage: 'Loading...',
+              })
+            : intl.formatMessage({
+                id: 'portal.postDetail.deleteDialog.confirmLabel',
+                defaultMessage: 'Delete post',
+              })
+      }
+      isPending={isPending || isLoadingLinks || isErrorLinks}
+      onConfirm={handleConfirm}
+    >
+      {isErrorLinks && (
+        <p className="text-sm text-destructive">
+          {intl.formatMessage({
+            id: 'portal.postDetail.deleteDialog.errorLinks',
+            defaultMessage: 'Failed to load linked integrations. Please close and try again.',
+          })}
+        </p>
+      )}
+      {hasLinks && (
+        <div className="rounded-lg border border-border/50 p-4 space-y-3">
+          {externalLinks.map((link) => {
+            const disabled = !link.integrationActive || !link.syncManaged
+            const checked = choices[link.id] ?? false
+            const verb = getIntegrationActionVerb(link.integrationType)
+            const name = getIntegrationDisplayName(link.integrationType)
+            const noun = getIntegrationItemNoun(link.integrationType)
+            const displayId = getDisplayId(link)
+            const Icon = INTEGRATION_ICON_MAP[link.integrationType]
+
+            return (
+              <div key={link.id} className="flex items-start gap-3">
+                <Checkbox
+                  id={`cascade-${link.id}`}
+                  checked={checked}
+                  onCheckedChange={(val) =>
+                    setChoices((prev) => ({ ...prev, [link.id]: val === true }))
+                  }
+                  disabled={disabled || isPending}
+                  className="mt-1"
+                />
+                <div className="flex-1 min-w-0">
+                  <Label
+                    htmlFor={`cascade-${link.id}`}
+                    className={`flex items-center gap-2 text-sm font-medium ${disabled ? 'text-muted-foreground' : ''}`}
+                  >
+                    {Icon && <Icon className="h-4 w-4 shrink-0" />}
+                    <span>
+                      {!link.integrationActive
+                        ? `${name} ${noun} (disconnected)`
+                        : !link.syncManaged
+                          ? `${name} ${noun} (reference only)`
+                          : `Review ${name} ${noun} for ${verb.toLowerCase() === 'close' ? 'closing' : 'archiving'}`}
+                    </span>
+                  </Label>
+                  <p className="text-xs text-muted-foreground mt-0.5 ml-6">
+                    <code className="rounded bg-muted px-1 py-0.5 text-[11px]">{displayId}</code>
+                    {!link.integrationActive
+                      ? `: integration disconnected, cannot ${verb.toLowerCase()}.`
+                      : !link.syncManaged
+                        ? `: manage this item directly on ${name}.`
+                        : ' will be added to sync history for manual review.'}
+                  </p>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </ConfirmDialog>
+  )
+}

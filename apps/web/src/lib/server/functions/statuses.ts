@@ -1,0 +1,167 @@
+/**
+ * Server functions for status operations
+ */
+
+import { z } from 'zod'
+import { createServerFn } from '@tanstack/react-start'
+import type { PostStatusId } from '@quackback/ids'
+import { requireAuth } from './auth-helpers'
+import { PERMISSIONS } from '@/lib/shared/permissions'
+import { HexColorFormatSchema, TaxonomyNameSchema } from '@/lib/shared/schemas/taxonomy'
+import {
+  listStatuses,
+  getStatusById,
+  createStatus,
+  updateStatus,
+  deleteStatus,
+  reorderStatuses,
+} from '@/lib/server/domains/statuses/status.service'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'statuses' })
+
+// ============================================
+// Schemas
+// ============================================
+
+const statusCategorySchema = z.enum(['active', 'complete', 'closed'])
+
+const createStatusSchema = z.object({
+  name: z.string().min(1, 'Name is required').max(50, 'Name must be 50 characters or less'),
+  slug: z
+    .string()
+    .min(1, 'Slug is required')
+    .max(50)
+    .regex(/^[a-z0-9_]+$/, 'Slug must be lowercase with underscores'),
+  color: HexColorFormatSchema,
+  category: statusCategorySchema,
+  position: z.number().int().min(0).optional(),
+  showOnRoadmap: z.boolean().optional(),
+  isDefault: z.boolean().optional(),
+})
+
+const getStatusSchema = z.object({
+  id: z.string(),
+})
+
+const updateStatusSchema = z.object({
+  id: z.string(),
+  name: TaxonomyNameSchema.optional(),
+  color: HexColorFormatSchema.optional(),
+  showOnRoadmap: z.boolean().optional(),
+  isDefault: z.boolean().optional(),
+})
+
+const deleteStatusSchema = z.object({
+  id: z.string(),
+})
+
+const reorderStatusesSchema = z.object({
+  statusIds: z.array(z.string()).min(1, 'At least one status ID is required'),
+})
+
+// ============================================
+// Type Exports
+// ============================================
+
+export type StatusCategory = z.infer<typeof statusCategorySchema>
+export type CreateStatusInput = z.infer<typeof createStatusSchema>
+export type GetStatusInput = z.infer<typeof getStatusSchema>
+export type UpdateStatusInput = z.infer<typeof updateStatusSchema>
+export type DeleteStatusInput = z.infer<typeof deleteStatusSchema>
+export type ReorderStatusesInput = z.infer<typeof reorderStatusesSchema>
+
+// ============================================
+// Read Operations
+// ============================================
+
+/**
+ * List all statuses for the workspace
+ */
+export const fetchStatusesFn = createServerFn({ method: 'GET' }).handler(async () => {
+  log.debug('fetch statuses')
+  await requireAuth({ permission: PERMISSIONS.STATUS_VIEW })
+
+  const statuses = await listStatuses()
+  log.debug({ count: statuses.length }, 'fetch statuses count')
+  return statuses
+})
+
+/**
+ * Get a single status by ID
+ */
+export const fetchStatusFn = createServerFn({ method: 'GET' })
+  .validator(getStatusSchema)
+  .handler(async ({ data }) => {
+    log.debug({ status_id: data.id }, 'fetch status')
+    await requireAuth({ permission: PERMISSIONS.STATUS_VIEW })
+
+    const status = await getStatusById(data.id as PostStatusId)
+    log.debug({ found: !!status }, 'fetch status result')
+    return status
+  })
+
+// ============================================
+// Write Operations
+// ============================================
+
+/**
+ * Create a new status
+ */
+export const createStatusFn = createServerFn({ method: 'POST' })
+  .validator(createStatusSchema)
+  .handler(async ({ data }) => {
+    log.debug({ category: data.category }, 'create status')
+    await requireAuth({ permission: PERMISSIONS.STATUS_MANAGE })
+
+    const status = await createStatus(data)
+    log.info({ status_id: status.id }, 'status created')
+    return status
+  })
+
+/**
+ * Update an existing status
+ */
+export const updateStatusFn = createServerFn({ method: 'POST' })
+  .validator(updateStatusSchema)
+  .handler(async ({ data }) => {
+    log.debug({ status_id: data.id }, 'update status')
+    await requireAuth({ permission: PERMISSIONS.STATUS_MANAGE })
+
+    const status = await updateStatus(data.id as PostStatusId, {
+      name: data.name,
+      color: data.color,
+      showOnRoadmap: data.showOnRoadmap,
+      isDefault: data.isDefault,
+    })
+    log.info({ status_id: status.id }, 'status updated')
+    return status
+  })
+
+/**
+ * Delete a status
+ */
+export const deleteStatusFn = createServerFn({ method: 'POST' })
+  .validator(deleteStatusSchema)
+  .handler(async ({ data }) => {
+    log.debug({ status_id: data.id }, 'delete status')
+    await requireAuth({ permission: PERMISSIONS.STATUS_MANAGE })
+
+    await deleteStatus(data.id as PostStatusId)
+    log.info({ status_id: data.id }, 'status deleted')
+    return { id: data.id as PostStatusId }
+  })
+
+/**
+ * Reorder statuses
+ */
+export const reorderStatusesFn = createServerFn({ method: 'POST' })
+  .validator(reorderStatusesSchema)
+  .handler(async ({ data }) => {
+    log.debug({ count: data.statusIds.length }, 'reorder statuses')
+    await requireAuth({ permission: PERMISSIONS.STATUS_MANAGE })
+
+    await reorderStatuses(data.statusIds as PostStatusId[])
+    log.info({ count: data.statusIds.length }, 'statuses reordered')
+    return { success: true }
+  })

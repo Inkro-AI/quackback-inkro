@@ -1,0 +1,264 @@
+/**
+ * Analytics refresh service -- aggregates daily stats and top posts.
+ *
+ * Called hourly by the analytics BullMQ job. Recomputes today's row in
+ * analytics_daily_stats and refreshes the top posts snapshots for all periods.
+ */
+
+import {
+  db,
+  eq,
+  gte,
+  lte,
+  and,
+  isNull,
+  isNotNull,
+  inArray,
+  count,
+  ne,
+  desc,
+  posts,
+  postVotes,
+  postComments,
+  principal,
+  postStatuses,
+  boards,
+  analyticsDailyStats,
+  analyticsTopPosts,
+} from '@/lib/server/db'
+import { toIsoDateOnly } from '@/lib/shared/utils/date'
+import { logger } from '@/lib/server/logger'
+import { notTestPrincipal } from '@/lib/server/test-data'
+
+const log = logger.child({ component: 'analytics' })
+
+/**
+ * Refresh today's row in analytics_daily_stats and the top posts snapshots.
+ * Called hourly by the analytics BullMQ job.
+ */
+export async function refreshAnalytics(): Promise<void> {
+  const today = toIsoDateOnly(new Date())
+  const dayStart = new Date(`${today}T00:00:00.000Z`)
+  const dayEnd = new Date(`${today}T23:59:59.999Z`)
+
+  log.debug({ date: today }, 'refreshing analytics stats')
+
+  // Run all count and groupBy queries in parallel
+  const [
+    [newPostsResult],
+    [newVotesResult],
+    [newCommentsResult],
+    [newUsersResult],
+    statusRows,
+    boardRows,
+  ] = await Promise.all([
+    db
+      .select({ value: count() })
+      .from(posts)
+      .where(
+        and(
+          gte(posts.createdAt, dayStart),
+          lte(posts.createdAt, dayEnd),
+          isNull(posts.deletedAt),
+          notTestPrincipal(posts.principalId)
+        )
+      ),
+    db
+      .select({ value: count() })
+      .from(postVotes)
+      .innerJoin(posts, eq(posts.id, postVotes.postId))
+      .where(
+        and(
+          gte(postVotes.createdAt, dayStart),
+          lte(postVotes.createdAt, dayEnd),
+          notTestPrincipal(posts.principalId),
+          notTestPrincipal(postVotes.principalId)
+        )
+      ),
+    db
+      .select({ value: count() })
+      .from(postComments)
+      .innerJoin(posts, eq(posts.id, postComments.postId))
+      .where(
+        and(
+          gte(postComments.createdAt, dayStart),
+          lte(postComments.createdAt, dayEnd),
+          isNull(postComments.deletedAt),
+          notTestPrincipal(posts.principalId),
+          notTestPrincipal(postComments.principalId)
+        )
+      ),
+    db
+      .select({ value: count() })
+      .from(principal)
+      .where(
+        and(
+          gte(principal.createdAt, dayStart),
+          lte(principal.createdAt, dayEnd),
+          ne(principal.type, 'anonymous'),
+          eq(principal.role, 'user'),
+          // A signup is a person with an account. The accountless principals
+          // that share role='user' — the deleted-user placeholder authored
+          // content is re-attributed to — are bookkeeping, not arrivals.
+          isNotNull(principal.userId),
+          notTestPrincipal(principal.id)
+        )
+      ),
+    db
+      .select({ slug: postStatuses.slug, value: count() })
+      .from(posts)
+      .innerJoin(postStatuses, eq(posts.statusId, postStatuses.id))
+      .where(and(isNull(posts.deletedAt), notTestPrincipal(posts.principalId)))
+      .groupBy(postStatuses.slug),
+    db
+      .select({ boardId: posts.boardId, value: count() })
+      .from(posts)
+      .where(
+        and(
+          gte(posts.createdAt, dayStart),
+          lte(posts.createdAt, dayEnd),
+          isNull(posts.deletedAt),
+          notTestPrincipal(posts.principalId)
+        )
+      )
+      .groupBy(posts.boardId),
+  ])
+
+  const postsByStatus: Record<string, number> = {}
+  for (const row of statusRows) {
+    postsByStatus[row.slug] = row.value
+  }
+
+  const postsByBoard: Record<string, number> = {}
+  for (const row of boardRows) {
+    if (row.boardId) postsByBoard[row.boardId] = row.value
+  }
+
+  const postsBySource: Record<string, number> = {
+    portal: newPostsResult.value,
+  }
+
+  // Upsert today's row
+  await db
+    .insert(analyticsDailyStats)
+    .values({
+      date: today,
+      newPosts: newPostsResult.value,
+      newVotes: newVotesResult.value,
+      newComments: newCommentsResult.value,
+      newUsers: newUsersResult.value,
+      postsByStatus,
+      postsByBoard,
+      postsBySource,
+      computedAt: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: analyticsDailyStats.date,
+      set: {
+        newPosts: newPostsResult.value,
+        newVotes: newVotesResult.value,
+        newComments: newCommentsResult.value,
+        newUsers: newUsersResult.value,
+        postsByStatus,
+        postsByBoard,
+        postsBySource,
+        computedAt: new Date(),
+      },
+    })
+
+  // Refresh top posts for each period
+  await refreshTopPosts()
+
+  log.info({ date: today }, 'analytics refresh completed')
+}
+
+async function refreshTopPosts(): Promise<void> {
+  const periods = [
+    { key: '7d', days: 7 },
+    { key: '30d', days: 30 },
+    { key: '90d', days: 90 },
+    { key: '12m', days: 365 },
+  ] as const
+
+  const now = new Date()
+
+  for (const { key, days } of periods) {
+    const since = new Date(now.getTime() - days * 86400000)
+
+    // Get top 10 posts by vote count within the period
+    const topPosts = await db
+      .select({
+        postId: posts.id,
+        title: posts.title,
+        voteCount: count(postVotes.id),
+        boardName: boards.name,
+        statusName: postStatuses.name,
+      })
+      .from(posts)
+      .leftJoin(
+        postVotes,
+        and(
+          eq(postVotes.postId, posts.id),
+          gte(postVotes.createdAt, since),
+          notTestPrincipal(postVotes.principalId)
+        )
+      )
+      .leftJoin(boards, eq(posts.boardId, boards.id))
+      .leftJoin(postStatuses, eq(posts.statusId, postStatuses.id))
+      .where(
+        and(
+          isNull(posts.deletedAt),
+          gte(posts.createdAt, since),
+          notTestPrincipal(posts.principalId)
+        )
+      )
+      .groupBy(posts.id, posts.title, boards.name, postStatuses.name)
+      .orderBy(desc(count(postVotes.id)))
+      .limit(10)
+
+    // Also get comment counts for these posts
+    const postIds = topPosts.map((p) => p.postId)
+    const commentCounts: Record<string, number> = {}
+    if (postIds.length > 0) {
+      const commentRows = await db
+        .select({
+          postId: postComments.postId,
+          value: count(),
+        })
+        .from(postComments)
+        .where(
+          and(
+            inArray(postComments.postId, postIds),
+            gte(postComments.createdAt, since),
+            isNull(postComments.deletedAt),
+            notTestPrincipal(postComments.principalId)
+          )
+        )
+        .groupBy(postComments.postId)
+
+      for (const row of commentRows) {
+        commentCounts[row.postId] = row.value
+      }
+    }
+
+    // Replace entries for this period atomically
+    await db.transaction(async (tx) => {
+      await tx.delete(analyticsTopPosts).where(eq(analyticsTopPosts.period, key))
+      if (topPosts.length > 0) {
+        await tx.insert(analyticsTopPosts).values(
+          topPosts.map((post, i) => ({
+            period: key,
+            rank: i + 1,
+            postId: post.postId,
+            title: post.title,
+            voteCount: post.voteCount,
+            commentCount: commentCounts[post.postId] ?? 0,
+            boardName: post.boardName,
+            statusName: post.statusName,
+            computedAt: new Date(),
+          }))
+        )
+      }
+    })
+  }
+}

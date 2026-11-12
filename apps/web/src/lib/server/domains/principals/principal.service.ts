@@ -1,0 +1,537 @@
+/**
+ * PrincipalService - Business logic for principals
+ *
+ * Provides principal lookup operations.
+ */
+
+import {
+  db,
+  eq,
+  ne,
+  and,
+  or,
+  sql,
+  ilike,
+  max,
+  principal,
+  session,
+  user,
+  type Principal,
+} from '@/lib/server/db'
+import type { PrincipalId, RoleId, UserId } from '@quackback/ids'
+import {
+  DomainException,
+  InternalError,
+  ForbiddenError,
+  NotFoundError,
+  ValidationError,
+} from '@/lib/shared/errors'
+import { isTeamMember, isAdmin, type Role } from '@/lib/shared/roles'
+import type { PermissionKey } from '@/lib/shared/permissions'
+import { recordAuditEvent, type AuditActor } from '@/lib/server/audit/log'
+import type { TeamMember } from './principal.types'
+import { resolveUserAvatarUrl } from './principal-display'
+import { logger } from '@/lib/server/logger'
+import { setPrincipalRole } from './principal.factory'
+import {
+  classifyTeamCandidate,
+  loadTeamCandidates,
+  promotePortalUsers,
+  retirePendingInvitesFor,
+  revokeRetiredInviteTokens,
+} from './team-promotion'
+import { assertSeatsAvailable, lockSeatLedger } from './seat-limit'
+import { assertCanChangeTeamRole } from '@/lib/server/domains/roles/role.grants'
+import { cacheDel } from '@/lib/server/cache'
+
+const log = logger.child({ component: 'principals' })
+
+// Re-export types for backwards compatibility
+export type { TeamMember } from './principal.types'
+
+/**
+ * Find a principal by user ID
+ */
+export async function getMemberByUser(userId: UserId): Promise<Principal | null> {
+  try {
+    const foundMember = await db.query.principal.findFirst({
+      where: eq(principal.userId, userId),
+    })
+    return foundMember ?? null
+  } catch (error) {
+    log.error({ err: error }, 'principal lookup failed')
+    throw new InternalError('DATABASE_ERROR', 'Failed to lookup principal', error)
+  }
+}
+
+/**
+ * Find a principal by ID
+ */
+export async function getMemberById(principalId: PrincipalId): Promise<Principal | null> {
+  try {
+    const foundMember = await db.query.principal.findFirst({
+      where: eq(principal.id, principalId),
+    })
+    return foundMember ?? null
+  } catch (error) {
+    log.error({ err: error }, 'principal lookup failed')
+    throw new InternalError('DATABASE_ERROR', 'Failed to lookup principal', error)
+  }
+}
+
+/**
+ * Principal creation, the role writer, and the profile-sync helpers now live in
+ * the principal factory — the single owner of principal inserts and role writes.
+ * Re-exported here so existing importers are unchanged.
+ */
+export {
+  createServicePrincipal,
+  syncPrincipalProfile,
+  syncPrincipalProfileById,
+} from './principal.factory'
+
+/**
+ * Teammates are identified humans (type='user') holding a teammate role
+ * (role != 'user'). One shared predicate so the team listers cannot drift.
+ * Without the role guard a portal end-user (role='user', type='user') would
+ * leak into team surfaces. People-facing pickers use searchPeople instead.
+ */
+export function teamMemberWhere() {
+  return and(eq(principal.type, 'user'), ne(principal.role, 'user'))
+}
+
+/**
+ * List all team members with user details
+ *
+ * `lastSignInAt` is computed as `max(session.created_at)` per user
+ * via a left-join subquery so the admin team list can show a
+ * "last sign-in" column without a second round-trip. Users with no
+ * sessions show `null` (never signed in or all sessions pruned).
+ */
+export async function listTeamMembers(): Promise<TeamMember[]> {
+  try {
+    // Subquery: latest session timestamp per user. Left-joined so
+    // users without sessions still appear in the result with null.
+    const lastSession = db
+      .select({
+        userId: session.userId,
+        lastSignInAt: max(session.createdAt).as('last_sign_in_at'),
+      })
+      .from(session)
+      .groupBy(session.userId)
+      .as('last_session')
+
+    const rawMembers = await db
+      .select({
+        id: principal.id,
+        userId: user.id,
+        name: user.name,
+        email: user.email,
+        image: user.image,
+        imageKey: user.imageKey,
+        role: principal.role,
+        createdAt: principal.createdAt,
+        lastSignInAt: sql<Date | string | null>`${lastSession.lastSignInAt}`,
+      })
+      .from(principal)
+      .innerJoin(user, eq(principal.userId, user.id))
+      .leftJoin(lastSession, eq(lastSession.userId, user.id))
+      .where(teamMemberWhere())
+
+    // The `max()` aggregate comes back as a string from postgres-js
+    // (Date mapping only fires on plain timestamp column selects);
+    // normalise to Date for the TeamMember type. Different shape from
+    // the server-fn boundary (which wants string), so we use a Date
+    // constructor directly rather than going through toIsoStringOrNull.
+    return rawMembers.map((m) => ({
+      id: m.id,
+      userId: m.userId,
+      name: m.name,
+      email: m.email,
+      image: resolveUserAvatarUrl({ userImage: m.image, userImageKey: m.imageKey }),
+      role: m.role,
+      createdAt: m.createdAt,
+      lastSignInAt: m.lastSignInAt == null ? null : new Date(m.lastSignInAt),
+    }))
+  } catch (error) {
+    log.error({ err: error }, 'failed to list team members')
+    throw new InternalError('DATABASE_ERROR', 'Failed to list team members', error)
+  }
+}
+
+/**
+ * Public-safe teammate avatars for the widget Home header: name + image only,
+ * nothing else leaves the server. Same teammate predicate as listTeamMembers
+ * (identified human + teammate role) so portal end-users, anonymous visitors,
+ * and service principals can never appear. Members with a real avatar image
+ * sort first so the cluster shows faces over initials.
+ */
+export async function listTeamAvatars(
+  limit = 3
+): Promise<{ name: string; avatarUrl: string | null }[]> {
+  try {
+    const rows = await db
+      .select({ name: user.name, image: user.image, imageKey: user.imageKey })
+      .from(principal)
+      .innerJoin(user, eq(principal.userId, user.id))
+      .where(teamMemberWhere())
+      .orderBy(
+        sql`((${user.image} IS NOT NULL) OR (${user.imageKey} IS NOT NULL)) DESC`,
+        principal.createdAt
+      )
+      .limit(limit)
+    return rows.map((r) => ({
+      name: r.name,
+      avatarUrl: resolveUserAvatarUrl({ userImage: r.image, userImageKey: r.imageKey }),
+    }))
+  } catch (error) {
+    log.error({ err: error }, 'failed to list team avatars')
+    throw new InternalError('DATABASE_ERROR', 'Failed to list team avatars', error)
+  }
+}
+
+/**
+ * Search PEOPLE by name or email: all identified humans, portal end-users
+ * deliberately included (anonymous and service principals excluded via
+ * type='user'). This is the on-behalf picker query (proxy voting, author
+ * selection), NOT a team roster: teammate surfaces use listTeamMembers,
+ * which applies teamMemberWhere().
+ */
+export async function searchPeople(params: {
+  search?: string
+  limit?: number
+}): Promise<TeamMember[]> {
+  const limit = Math.min(params.limit ?? 20, 50)
+  const conditions = [eq(principal.type, 'user')]
+
+  if (params.search?.trim()) {
+    const q = `%${params.search.trim()}%`
+    conditions.push(or(ilike(user.name, q), ilike(user.email, q))!)
+  }
+
+  const rows = await db
+    .select({
+      id: principal.id,
+      userId: user.id,
+      name: user.name,
+      email: user.email,
+      image: user.image,
+      imageKey: user.imageKey,
+      role: principal.role,
+      createdAt: principal.createdAt,
+      // The typeahead path never displays last-sign-in, so a null
+      // literal is cheaper than the group-by in listTeamMembers.
+      lastSignInAt: sql<Date | null>`NULL::timestamptz`,
+    })
+    .from(principal)
+    .innerJoin(user, eq(principal.userId, user.id))
+    .where(and(...conditions))
+    .orderBy(user.name)
+    .limit(limit)
+  return rows.map((r) => ({
+    id: r.id,
+    userId: r.userId,
+    name: r.name,
+    email: r.email,
+    image: resolveUserAvatarUrl({ userImage: r.image, userImageKey: r.imageKey }),
+    role: r.role,
+    createdAt: r.createdAt,
+    lastSignInAt: r.lastSignInAt,
+  }))
+}
+
+/**
+ * Count all principals excluding anonymous voters (no auth required)
+ */
+export async function countMembers(): Promise<number> {
+  try {
+    const result = await db
+      .select({ count: sql<number>`count(*)`.as('count') })
+      .from(principal)
+      .where(ne(principal.type, 'anonymous'))
+
+    return Number(result[0]?.count ?? 0)
+  } catch (error) {
+    log.error({ err: error }, 'failed to count principals')
+    throw new InternalError('DATABASE_ERROR', 'Failed to count principals', error)
+  }
+}
+
+/**
+ * Set a person's team role: change an existing teammate's role, or add a
+ * signed-in portal user to the team at once (no accept step). `opts.assignRoleId`
+ * grants a specific role from the roles table instead of the legacy preset
+ * mapping; the legacy column stays 'member' (the teammate wall and seat
+ * predicates key on it) while the workspace assignment carries the actual
+ * grant. Owner is excluded: that tier rides the legacy 'admin' role, which
+ * only an admin may grant (`opts.granterRole`, fail closed).
+ *
+ * Adding a portal user takes a seat, checked on the write transaction.
+ * Eligibility (a real person who has signed in) lives in team-promotion.ts.
+ *
+ * @throws ForbiddenError if trying to modify own role
+ * @throws ForbiddenError GRANT_CEILING if a non-admin grants Admin, or a role above the granter
+ * @throws ForbiddenError if this would leave no admins
+ * @throws ValidationError NOT_ELIGIBLE if the portal user has never signed in
+ * @throws TierLimitError SEAT_LIMIT if adding a portal user needs a seat that is not free
+ * @throws NotFoundError if the principal is not a teammate or a portal user
+ */
+export async function updateMemberRole(
+  principalId: PrincipalId,
+  newRole: 'admin' | 'member',
+  actingPrincipalId: PrincipalId,
+  actor: AuditActor | null = null,
+  headers?: Headers,
+  opts?: {
+    assignRoleId?: RoleId
+    granterPermissions?: readonly PermissionKey[]
+    /** The granter's legacy role; granting Admin requires 'admin'. */
+    granterRole?: Role | null
+  }
+): Promise<{ role: 'admin' | 'member'; roleId?: RoleId; roleName?: string }> {
+  // Cannot modify own role
+  if (principalId === actingPrincipalId) {
+    throw new ForbiddenError('CANNOT_MODIFY_SELF', 'You cannot change your own role')
+  }
+
+  let assignedRoleName: string | null = null
+  if (opts?.assignRoleId) {
+    if (newRole !== 'member') {
+      throw new ValidationError(
+        'VALIDATION_ERROR',
+        'Custom role grants ride the member role; use role admin without a roleId to promote'
+      )
+    }
+    // Assignment is a grant: fail closed if the caller didn't supply its own
+    // resolved set for the ceiling check.
+    if (!opts.granterPermissions) {
+      throw new ForbiddenError('GRANT_CEILING', 'Assigner permission set is required')
+    }
+    const { assertGrantableRole } = await import('@/lib/server/domains/roles/role.grants')
+    const target = await assertGrantableRole(opts.assignRoleId, opts.granterPermissions)
+    assignedRoleName = target.name
+  }
+  const { assertCanGrantTeamRole } = await import('@/lib/server/domains/roles/role.grants')
+  assertCanGrantTeamRole(newRole, opts?.granterRole)
+
+  try {
+    const targetMember = await db.query.principal.findFirst({
+      where: eq(principal.id, principalId),
+    })
+
+    if (!targetMember) {
+      throw new NotFoundError('MEMBER_NOT_FOUND', 'Team member not found')
+    }
+
+    // A customer teammate changes role; a portal user joins the team. Cloud
+    // support (type=support) is an admin for privilege but is not on the
+    // customer roster, and anonymous or service principals never join.
+    const isTeammate = isTeamMember(targetMember.role) && targetMember.type !== 'support'
+    const isPortalUser =
+      targetMember.role === 'user' && targetMember.type === 'user' && targetMember.userId != null
+    if (!isTeammate && !isPortalUser) {
+      throw new NotFoundError('MEMBER_NOT_FOUND', 'Team member not found')
+    }
+    // Only an admin changes an admin's role.
+    assertCanChangeTeamRole(targetMember.role, opts?.granterRole)
+    if (isPortalUser) {
+      const [candidate] = await loadTeamCandidates([principalId])
+      if (!candidate || classifyTeamCandidate(candidate) !== 'eligible') {
+        throw new ValidationError(
+          'NOT_ELIGIBLE',
+          `${candidate?.name || 'This person'} hasn't signed in yet. Invite them by email instead.`
+        )
+      }
+    }
+
+    // If demoting an admin to member, ensure at least one human admin remains
+    if (isAdmin(targetMember.role) && newRole === 'member') {
+      const adminCount = await db
+        .select({ count: sql<number>`count(*)`.as('count') })
+        .from(principal)
+        .where(and(eq(principal.role, 'admin'), eq(principal.type, 'user')))
+
+      if (Number(adminCount[0]?.count ?? 0) <= 1) {
+        throw new ForbiddenError('LAST_ADMIN', 'Cannot demote the last admin')
+      }
+    }
+
+    const previousRole = targetMember.role
+
+    if (isPortalUser) {
+      // Joining the team takes a seat: count and write on one transaction
+      // under the seat-ledger lock so racing additions cannot overfill. A
+      // pending team invite for the person is retired first, so its seat is
+      // the one they take and it can never be accepted later.
+      const { cacheKeys, retiredTokens } = await db.transaction(async (tx) => {
+        await lockSeatLedger(tx)
+        const retiredTokens = await retirePendingInvitesFor(tx, [targetMember.userId as UserId])
+        await assertSeatsAvailable(1, { executor: tx })
+        const cacheKeys = await promotePortalUsers(
+          tx,
+          [{ id: principalId, userId: targetMember.userId }],
+          newRole,
+          { assignRoleId: opts?.assignRoleId, grantedBy: actingPrincipalId }
+        )
+        return { cacheKeys, retiredTokens }
+      })
+      for (const key of cacheKeys) await cacheDel(key)
+      await revokeRetiredInviteTokens(retiredTokens)
+    } else {
+      // Update the role (the factory busts PRINCIPAL_BY_USER from the row's
+      // userId and reconciles the workspace assignment in the same transaction).
+      await setPrincipalRole({ principalId }, newRole, {
+        knownUserId: targetMember.userId,
+        assignRoleId: opts?.assignRoleId,
+        assignGrantedBy: actingPrincipalId,
+      })
+    }
+
+    // Audit the role change. Already audited from the SSO/JIT path
+    // (`auth/hooks.ts` emits user.role.changed there). Admin manual
+    // role flips and additions from the portal need the same coverage or
+    // the audit log doesn't tell the full story of who got which role.
+    if (actor) {
+      await recordAuditEvent({
+        event: 'user.role.changed',
+        actor,
+        headers,
+        target: { type: 'principal', id: principalId },
+        before: { role: previousRole },
+        after: {
+          role: newRole,
+          ...(assignedRoleName ? { assignedRole: assignedRoleName } : {}),
+        },
+      })
+    }
+    return {
+      role: newRole,
+      ...(opts?.assignRoleId ? { roleId: opts.assignRoleId } : {}),
+      ...(assignedRoleName ? { roleName: assignedRoleName } : {}),
+    }
+  } catch (error) {
+    if (error instanceof DomainException) {
+      throw error
+    }
+    log.error({ err: error }, 'failed to update principal role')
+    throw new InternalError('DATABASE_ERROR', 'Failed to update principal role', error)
+  }
+}
+
+/**
+ * Remove a team member (converts them to a portal user)
+ * @throws ForbiddenError if trying to remove self
+ * @throws ForbiddenError if this would leave no admins
+ * @throws NotFoundError if principal not found or not a team member
+ */
+export async function removeTeamMember(
+  principalId: PrincipalId,
+  actingPrincipalId: PrincipalId,
+  actor: AuditActor | null = null,
+  headers?: Headers,
+  opts?: {
+    /** The remover's legacy role; removing an admin requires 'admin' (fail closed). */
+    granterRole?: Role | null
+  }
+): Promise<void> {
+  // Cannot remove self
+  if (principalId === actingPrincipalId) {
+    throw new ForbiddenError('CANNOT_REMOVE_SELF', 'You cannot remove yourself from the team')
+  }
+
+  try {
+    // Find the target principal
+    const targetMember = await db.query.principal.findFirst({
+      where: eq(principal.id, principalId),
+    })
+
+    if (!targetMember) {
+      throw new NotFoundError('MEMBER_NOT_FOUND', 'Team member not found')
+    }
+
+    // Ensure target is a customer teammate. Cloud support is not on the roster.
+    if (!isTeamMember(targetMember.role) || targetMember.type === 'support') {
+      throw new NotFoundError('MEMBER_NOT_FOUND', 'Team member not found')
+    }
+
+    // Only an admin removes an admin.
+    assertCanChangeTeamRole(targetMember.role, opts?.granterRole)
+
+    // If removing an admin, ensure at least one human admin remains
+    if (isAdmin(targetMember.role)) {
+      const adminCount = await db
+        .select({ count: sql<number>`count(*)`.as('count') })
+        .from(principal)
+        .where(and(eq(principal.role, 'admin'), eq(principal.type, 'user')))
+
+      if (Number(adminCount[0]?.count ?? 0) <= 1) {
+        throw new ForbiddenError('LAST_ADMIN', 'Cannot remove the last admin')
+      }
+    }
+
+    const previousRole = targetMember.role
+
+    // Convert to portal user by setting role to 'user'
+    await setPrincipalRole({ principalId }, 'user', { knownUserId: targetMember.userId })
+
+    // Audit the removal. The audit-event taxonomy already reserves
+    // `user.removed` for this exact action (audit/log.ts); without an
+    // emission the event was a dead literal and the team can't see
+    // who lost which role.
+    if (actor) {
+      await recordAuditEvent({
+        event: 'user.removed',
+        actor,
+        headers,
+        target: { type: 'principal', id: principalId },
+        before: { role: previousRole },
+        after: { role: 'user' },
+      })
+    }
+  } catch (error) {
+    if (error instanceof ForbiddenError || error instanceof NotFoundError) {
+      throw error
+    }
+    log.error({ err: error }, 'failed to remove team member')
+    throw new InternalError('DATABASE_ERROR', 'Failed to remove team member', error)
+  }
+}
+
+/**
+ * Convert the signed-in teammate to a portal user. The control-plane owner
+ * gate lives at the caller; this only updates the workspace-owned roster.
+ */
+export async function leaveTeamSelf(
+  actingPrincipalId: PrincipalId,
+  actor: AuditActor | null = null,
+  headers?: Headers
+): Promise<void> {
+  try {
+    const me = await db.query.principal.findFirst({
+      where: eq(principal.id, actingPrincipalId),
+    })
+    if (!me || !isTeamMember(me.role)) {
+      throw new NotFoundError('MEMBER_NOT_FOUND', 'Team member not found')
+    }
+
+    const previousRole = me.role
+    await setPrincipalRole({ principalId: actingPrincipalId }, 'user', { knownUserId: me.userId })
+
+    if (actor) {
+      await recordAuditEvent({
+        event: 'user.removed',
+        actor,
+        headers,
+        target: { type: 'principal', id: actingPrincipalId },
+        before: { role: previousRole },
+        after: { role: 'user' },
+      })
+    }
+  } catch (error) {
+    if (error instanceof ForbiddenError || error instanceof NotFoundError) {
+      throw error
+    }
+    log.error({ err: error }, 'failed to leave team')
+    throw new InternalError('DATABASE_ERROR', 'Failed to leave the team', error)
+  }
+}

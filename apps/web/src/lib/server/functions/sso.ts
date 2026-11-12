@@ -1,0 +1,885 @@
+/**
+ * Admin-only server functions for SSO/OIDC management.
+ *
+ *  - `clearSsoClientSecretFn` — removes the customer's IdP-issued client
+ *    secret from `platform_credentials` (encrypted, cross-pod-invalidated).
+ *    Used to rotate the secret or wind SSO down.
+ *
+ *  - Verified-domain reads/removal (`getVerifiedDomainsFn`,
+ *    `removeVerifiedDomainFn`) — manage the per-workspace list of verified
+ *    domains. Each row carries its own `enforced` flag: when on, emails at
+ *    that domain are hard-bound to SSO (password / magic-link / non-SSO
+ *    OAuth blocked).
+ *
+ *  - Identity-provider CRUD (`listIdentityProvidersFn`,
+ *    `upsertIdentityProviderFn`, `deleteIdentityProviderFn`,
+ *    `setProviderCredentialsFn`, `addProviderDomainFn`,
+ *    `verifyProviderDomainFn`, `setDomainEnforcedFn`) — the multi-provider
+ *    model: admin-gated wrappers over `identity-providers.service` that add
+ *    the auth gate, the audit row, and provider-scoped domain handling.
+ */
+
+import { createServerFn } from '@tanstack/react-start'
+import { getRequestHeaders } from '@tanstack/react-start/server'
+import { z } from 'zod'
+import type { IdentityProviderId } from '@quackback/ids'
+import { ConflictError, ForbiddenError, ValidationError } from '@/lib/shared/errors'
+import { httpsUrl } from '@/lib/shared/schemas/auth'
+import { actorFromAuth, withAuditEvent } from '@/lib/server/audit/log'
+import { PERMISSIONS } from '@/lib/shared/permissions'
+import { shownProofSource, type ShownProofSource } from '@/lib/shared/domain-proof'
+import { diffProviderAudit } from '@/lib/server/auth/idp-audit-diff'
+import { applyClaimMappingEdits } from '@/lib/shared/sso-claim-mapping-edit'
+import { PROFILE_FIELDS, isRoleRuleRoleId } from '@/lib/shared/oidc-claim-mapping'
+import { OIDC_REDIRECT_STYLES } from '@/lib/shared/oidc-redirect'
+import { requireAuth } from './auth-helpers'
+
+const verifiedDomainId = z.string().regex(/^domain_/) as z.ZodType<`domain_${string}`>
+
+/**
+ * Remove the SSO OIDC client secret. Use to rotate (delete + save
+ * again) or wind down SSO. The auth runtime will skip SSO registration
+ * on the next request because no secret is available.
+ */
+export const clearSsoClientSecretFn = createServerFn({ method: 'POST' }).handler(async () => {
+  const auth = await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+
+  return withAuditEvent(
+    {
+      event: 'sso.config.changed',
+      actor: actorFromAuth(auth),
+      metadata: { field: 'clientSecret', action: 'cleared' },
+      headers: getRequestHeaders(),
+    },
+    async () => {
+      // Refuse to clear while any verified domain has enforcement on —
+      // clearing the secret skips SSO registration, and enforced-domain
+      // emails would have no working sign-in path. Refuse also when any
+      // domain is verified at all: those emails are routed to SSO by
+      // default; without the secret, the redirect would 4xx. Force the
+      // admin to explicitly remove the affected domains first.
+      const { getWorkspaceSettings } =
+        await import('@/lib/server/domains/settings/settings.service')
+      const workspace = await getWorkspaceSettings()
+      const enforcedRow = workspace?.verifiedDomains.find((d) => d.enforced)
+      if (enforcedRow) {
+        const { ValidationError } = await import('@/lib/shared/errors')
+        throw new ValidationError(
+          'SSO_ENFORCEMENT_ACTIVE',
+          `Disable SSO enforcement on ${enforcedRow.name} before removing the client secret.`
+        )
+      }
+      const verifiedRow = workspace?.verifiedDomains.find((d) => d.verifiedAt !== null)
+      if (verifiedRow) {
+        const { ValidationError } = await import('@/lib/shared/errors')
+        throw new ValidationError(
+          'SSO_DOMAIN_VERIFIED',
+          `Remove the verified domain ${verifiedRow.name} before removing the client secret.`
+        )
+      }
+      // Clearing the secret unconfigures the 'sso' provider; refuse if it's the
+      // workspace's only working sign-in method (a no-public-button 'sso' isn't
+      // caught by the verified-domain checks above).
+      const { listIdentityProviders } =
+        await import('@/lib/server/domains/settings/identity-providers.service')
+      const ssoProvider = (await listIdentityProviders()).find((p) => p.registrationId === 'sso')
+      if (ssoProvider) {
+        const { checkIsOnlyWorkingSignInMethod } =
+          await import('@/lib/server/auth/sign-in-method-availability')
+        if (await checkIsOnlyWorkingSignInMethod(ssoProvider.id)) {
+          throw new ConflictError(
+            'LAST_SIGN_IN_METHOD',
+            'Cannot remove the only enabled sign-in method. Enable another method first.'
+          )
+        }
+      }
+      const { deletePlatformCredentials } =
+        await import('@/lib/server/domains/platform-credentials/platform-credential.service')
+      const { SSO_CREDENTIAL_TYPE } = await import('@/lib/server/auth/sso-secret')
+      await deletePlatformCredentials(SSO_CREDENTIAL_TYPE)
+      return { success: true }
+    }
+  )
+})
+
+// =============================================================================
+// SSO domain verification
+// =============================================================================
+
+/**
+ * Per-domain rate-limit (set-if-absent, 10s window). Throws when
+ * throttled. Keyed on workspace+domain so admins can verify multiple
+ * pending domains in parallel without throttling each other.
+ */
+async function assertVerifyDomainRateLimit(workspaceKey: string, domainId: string): Promise<void> {
+  const { kvSetNx } = await import('@/lib/server/kv/pg-kv')
+  const took = await kvSetNx(`verify-domain:${workspaceKey}:${domainId}`, 1, 10)
+  if (!took) {
+    throw new ConflictError(
+      'VERIFY_RATE_LIMITED',
+      'Slow down — wait a few seconds before retrying.'
+    )
+  }
+}
+
+const removeVerifiedDomainInput = z.object({ id: verifiedDomainId })
+
+/** Remove a verified-domain row by id. No-op if it doesn't exist. */
+export const removeVerifiedDomainFn = createServerFn({ method: 'POST' })
+  .validator(removeVerifiedDomainInput)
+  .handler(async ({ data }) => {
+    await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+    const { removeVerifiedDomain } = await import('@/lib/server/domains/settings/settings.service')
+    await removeVerifiedDomain(data.id)
+    return { success: true }
+  })
+
+export type VerifyDomainResult =
+  | { verified: true; verifiedAt: string; via: 'dns' | ShownProofSource }
+  | { verified: false; reason: 'no-record' | 'lookup-failed' | 'mismatch' | 'no-pending-domain' }
+
+/** Read-only listing of the workspace's verified-domain rows. */
+export const getVerifiedDomainsFn = createServerFn({ method: 'GET' }).handler(async () => {
+  await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+  const { getWorkspaceSettings } = await import('@/lib/server/domains/settings/settings.service')
+  const workspace = await getWorkspaceSettings()
+  return workspace?.verifiedDomains ?? []
+})
+
+// =============================================================================
+// Identity-provider CRUD (multi-provider, Task 15)
+//
+// Admin-gated wrappers over `identity-providers.service` — the data logic
+// (version bump + resetAuth + cache invalidation, credential cleanup) lives
+// in the service; these add the auth gate, the audit row, and provider-scoped
+// verified-domain handling on top.
+// =============================================================================
+
+/** TypeID validator for an identity-provider row id. */
+const identityProviderId = z.string().regex(/^idp_/) as z.ZodType<IdentityProviderId>
+
+const idpRole = z.enum(['admin', 'member', 'user'])
+
+/** A role rule. `roleId` grants a workspace role and rides the member tier only;
+ *  whether the saver may grant it is checked in the service. */
+const roleRuleFields = {
+  whenContains: z.string(),
+  role: idpRole,
+  roleId: z.string().refine(isRoleRuleRoleId, { message: 'Invalid role id.' }).optional(),
+}
+const customRoleOnMemberTier = {
+  check: (rule: { role: string; roleId?: string }) =>
+    rule.roleId === undefined || rule.role === 'member',
+  message: 'A workspace role can only be granted on the member tier.',
+}
+const roleRuleSchema = z
+  .object(roleRuleFields)
+  .refine(customRoleOnMemberTier.check, { message: customRoleOnMemberTier.message })
+
+/** Mirror of `IdentityProviderClaimMapping`, section by section. */
+const claimRoleSchema = z.object({
+  claimPath: z.string(),
+  rules: z.array(
+    z
+      .object(roleRuleFields)
+      .passthrough()
+      .refine(customRoleOnMemberTier.check, { message: customRoleOnMemberTier.message })
+  ),
+  syncOnEverySignIn: z.boolean().optional(),
+})
+
+const claimMappingSchema = z
+  .object({
+    profile: z
+      .object({
+        sources: z.array(z.enum(['idToken', 'userinfo', 'accessTokenJwt'])).optional(),
+        claims: z
+          .object({
+            id: z.string().optional(),
+            email: z.string().optional(),
+            name: z.string().optional(),
+            username: z.string().optional(),
+            image: z.string().optional(),
+          })
+          .passthrough()
+          .optional(),
+        allowMissingEmail: z.boolean().optional(),
+        syncOnSignIn: z.boolean().optional(),
+      })
+      .passthrough()
+      .optional(),
+    role: claimRoleSchema.passthrough().optional(),
+    attributes: z
+      .object({
+        map: z
+          .array(z.object({ claimPath: z.string(), attributeKey: z.string() }).passthrough())
+          .optional(),
+        overrideExisting: z.boolean().optional(),
+        syncOnSignIn: z.boolean().optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough()
+
+/**
+ * Identity-provider registrationIds are restricted to the generated `oidc_`
+ * namespace plus the two legacy ids (`sso` / `custom-oidc`). This blocks
+ * registering a provider under a built-in method id such as `credential`,
+ * `magic-link`, or a social id like `google`: a registered OIDC provider is
+ * allowed by `isAuthMethodAllowed` BEFORE the built-in toggles are consulted,
+ * so a provider named `credential` would let password sign-ins bypass
+ * `authConfig.oauth.password === false`.
+ */
+export function isAllowedRegistrationId(id: string): boolean {
+  return id === 'sso' || id === 'custom-oidc' || /^oidc_[a-z0-9]+$/i.test(id)
+}
+
+const upsertIdentityProviderInput = z.object({
+  // Present when editing; absent on create (matched by registrationId).
+  id: identityProviderId.optional(),
+  registrationId: z.string().min(1).max(64).refine(isAllowedRegistrationId, {
+    message: 'registrationId must be a generated oidc_ id (or the legacy sso / custom-oidc).',
+  }),
+  label: z.string().min(1).max(120),
+  // IdP family from the setup shortcut — purely drives which editor controls
+  // and label render; does not affect Better-Auth registration.
+  kind: z.enum(['okta', 'auth0', 'keycloak', 'entra', 'google', 'other']).nullable().optional(),
+  clientId: z.string().min(1).max(512),
+  discoveryUrl: httpsUrl.nullable().optional(),
+  authorizationUrl: httpsUrl.nullable().optional(),
+  tokenUrl: httpsUrl.nullable().optional(),
+  userInfoUrl: httpsUrl.nullable().optional(),
+  jwksUri: httpsUrl.nullable().optional(),
+  issuer: httpsUrl.nullable().optional(),
+  scopes: z.string().max(512).nullable().optional(),
+  prompt: z.string().max(64).nullable().optional(),
+  tokenEndpointAuthMethod: z.string().max(32).nullable().optional(),
+  idTokenNonce: z.string().max(16).nullable().optional(),
+  enabled: z.boolean().optional(),
+  autoCreateUsers: z.boolean().optional(),
+  autoProvisionRole: idpRole.nullable().optional(),
+  claimMapping: claimMappingSchema.nullable().optional(),
+  showButton: z.boolean().optional(),
+  acknowledgeIdentifierChange: z.boolean().optional(),
+  acknowledgeAdminRules: z.boolean().optional(),
+})
+
+/** Read-only listing of every identity provider with its linked domains. */
+export const listIdentityProvidersFn = createServerFn({ method: 'GET' }).handler(async () => {
+  await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+  const { listIdentityProviders } =
+    await import('@/lib/server/domains/settings/identity-providers.service')
+  return listIdentityProviders()
+})
+
+/**
+ * Create or update a provider (matched by `id`, else by `registrationId`).
+ * Emits `idp.created` / `idp.updated` based on whether a matching row
+ * already exists; the underlying service bumps the auth-config version and
+ * resets the local auth instance so the new config registers.
+ */
+export const upsertIdentityProviderFn = createServerFn({ method: 'POST' })
+  .validator(upsertIdentityProviderInput)
+  .handler(async ({ data }) => {
+    const auth = await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+
+    const { listIdentityProviders, upsertIdentityProvider } =
+      await import('@/lib/server/domains/settings/identity-providers.service')
+    const { roleRuleGrantCheck } = await import('@/lib/server/domains/roles/role.rule-grants')
+    const existing = await listIdentityProviders()
+    const prior = data.id
+      ? existing.find((p) => p.id === data.id)
+      : existing.find((p) => p.registrationId === data.registrationId)
+
+    // Plan gate. The carve-out is exactly one shape — taking a currently-enabled
+    // provider out of service — so a workspace that loses the entitlement can
+    // still switch SSO off. It deliberately mirrors the lockout check below
+    // rather than the looser `data.enabled !== false`: that form also let a
+    // caller CREATE a provider, persisting a full set of connection details and
+    // an idp.created audit event, merely by sending `enabled: false`. Editing an
+    // already-disabled provider is a reconfiguration, not a take-out-of-service,
+    // and needs the entitlement like any other write.
+    //
+    // No-op on any install without a cloud config.
+    const isTakingProviderOutOfService = data.enabled === false && prior?.enabled === true
+    if (!isTakingProviderOutOfService) {
+      const { requireEntitlement } =
+        await import('@/lib/server/domains/settings/cloud/entitlements')
+      await requireEntitlement('sso')
+    }
+
+    // Refuse to disable the workspace's only working sign-in method (lockout).
+    // Only a true→false transition on a currently-usable provider can do it.
+    if (data.enabled === false && prior?.enabled && prior.configured) {
+      const { checkIsOnlyWorkingSignInMethod } =
+        await import('@/lib/server/auth/sign-in-method-availability')
+      if (await checkIsOnlyWorkingSignInMethod(prior.id, existing)) {
+        throw new ConflictError(
+          'LAST_SIGN_IN_METHOD',
+          'Cannot disable the only enabled sign-in method. Enable another method first.'
+        )
+      }
+    }
+
+    // Field-level diff over the whole DTO. Recording only label + enabled left
+    // every field that decides identity resolution — the endpoints, clientId,
+    // scopes, the attribute mapping — with no trace, so repointing a claim and
+    // then repointing it back produced two identical rows.
+    const { before, after } = diffProviderAudit(prior ?? null, data)
+
+    return withAuditEvent(
+      {
+        event: prior ? 'idp.updated' : 'idp.created',
+        actor: actorFromAuth(auth),
+        target: { type: 'identity_provider', id: prior?.id ?? data.registrationId },
+        before,
+        after,
+        headers: getRequestHeaders(),
+      },
+      async () =>
+        upsertIdentityProvider({
+          ...data,
+          checkRoleGrants: roleRuleGrantCheck(auth.permissions),
+        })
+    )
+  })
+
+const profileField = z.enum(PROFILE_FIELDS)
+
+const claimMappingOperationSchema = z.discriminatedUnion('op', [
+  z.object({
+    op: z.literal('setProfileClaim'),
+    field: profileField,
+    path: z.string(),
+  }),
+  z.object({ op: z.literal('resetProfileClaim'), field: profileField }),
+  z.object({ op: z.literal('setProfileSync'), syncOnSignIn: z.boolean() }),
+  z.object({
+    op: z.literal('setSources'),
+    sources: z.array(z.enum(['idToken', 'userinfo', 'accessTokenJwt'])),
+  }),
+  z.object({ op: z.literal('resetSources') }),
+  z.object({ op: z.literal('setAllowMissingEmail'), allow: z.boolean() }),
+  z.object({ op: z.literal('setRolePath'), claimPath: z.string() }),
+  z.object({
+    op: z.literal('insertRoleRule'),
+    index: z.number().int().nonnegative(),
+    rule: roleRuleSchema,
+  }),
+  z.object({
+    op: z.literal('editRoleRule'),
+    index: z.number().int().nonnegative(),
+    rule: roleRuleSchema,
+  }),
+  z.object({ op: z.literal('removeRoleRule'), index: z.number().int().nonnegative() }),
+  z.object({
+    op: z.literal('reorderRoleRule'),
+    from: z.number().int().nonnegative(),
+    to: z.number().int().nonnegative(),
+  }),
+  z.object({ op: z.literal('setRoleSync'), syncOnEverySignIn: z.boolean() }),
+  z.object({ op: z.literal('removeRole') }),
+  z.object({
+    op: z.literal('insertPeopleMapping'),
+    index: z.number().int().nonnegative(),
+    entry: z.object({ claimPath: z.string(), attributeKey: z.string() }),
+  }),
+  z.object({
+    op: z.literal('editPeopleMapping'),
+    index: z.number().int().nonnegative(),
+    entry: z.object({ claimPath: z.string(), attributeKey: z.string() }),
+  }),
+  z.object({ op: z.literal('removePeopleMapping'), index: z.number().int().nonnegative() }),
+  z.object({
+    op: z.literal('setPeopleFlags'),
+    overrideExisting: z.boolean().optional(),
+    syncOnSignIn: z.boolean().optional(),
+  }),
+])
+
+const saveClaimMappingInput = z.object({
+  id: identityProviderId,
+  expectedClaimMapping: z.unknown(),
+  operations: z.array(claimMappingOperationSchema),
+  acknowledgeIdentifierChange: z.boolean().optional(),
+  acknowledgeAdminRules: z.boolean().optional(),
+})
+
+export const saveIdentityProviderClaimMappingFn = createServerFn({ method: 'POST' })
+  .validator(saveClaimMappingInput)
+  .handler(async ({ data }) => {
+    const auth = await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+    const { requireEntitlement } = await import('@/lib/server/domains/settings/cloud/entitlements')
+    await requireEntitlement('sso')
+
+    const { listIdentityProviders, saveIdentityProviderClaimMapping } =
+      await import('@/lib/server/domains/settings/identity-providers.service')
+    const { roleRuleGrantCheck } = await import('@/lib/server/domains/roles/role.rule-grants')
+    const existing = await listIdentityProviders()
+    const prior = existing.find((p) => p.id === data.id)
+    if (!prior) {
+      throw new ValidationError('IDP_NOT_FOUND', 'Identity provider not found.')
+    }
+
+    const nextMapping = applyClaimMappingEdits(prior.claimMapping, data.operations)
+    const { before, after } = diffProviderAudit(prior, {
+      ...prior,
+      claimMapping: nextMapping as typeof prior.claimMapping,
+    })
+
+    return withAuditEvent(
+      {
+        event: 'idp.updated',
+        actor: actorFromAuth(auth),
+        target: { type: 'identity_provider', id: data.id },
+        before,
+        after,
+        headers: getRequestHeaders(),
+      },
+      async () =>
+        saveIdentityProviderClaimMapping(data.id, {
+          expectedClaimMapping: data.expectedClaimMapping,
+          operations: data.operations,
+          acknowledgeIdentifierChange: data.acknowledgeIdentifierChange,
+          acknowledgeAdminRules: data.acknowledgeAdminRules,
+          checkRoleGrants: roleRuleGrantCheck(auth.permissions),
+        })
+    )
+  })
+
+const deleteIdentityProviderInput = z.object({ id: identityProviderId })
+
+/**
+ * Delete a provider by id. The service cascades its linked domains via the
+ * FK and removes the `auth_<registrationId>` credential explicitly (no FK
+ * to cascade), then resets auth.
+ */
+export const deleteIdentityProviderFn = createServerFn({ method: 'POST' })
+  .validator(deleteIdentityProviderInput)
+  .handler(async ({ data }) => {
+    const auth = await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+
+    // Refuse to remove the workspace's only working sign-in method — doing so
+    // would lock everyone out. Mirrors the UI's disabled Remove button.
+    const { checkIsOnlyWorkingSignInMethod } =
+      await import('@/lib/server/auth/sign-in-method-availability')
+    if (await checkIsOnlyWorkingSignInMethod(data.id)) {
+      throw new ConflictError(
+        'LAST_SIGN_IN_METHOD',
+        'Cannot remove the only enabled sign-in method. Enable another method first.'
+      )
+    }
+
+    return withAuditEvent(
+      {
+        event: 'idp.deleted',
+        actor: actorFromAuth(auth),
+        target: { type: 'identity_provider', id: data.id },
+        headers: getRequestHeaders(),
+      },
+      async () => {
+        const { deleteIdentityProvider } =
+          await import('@/lib/server/domains/settings/identity-providers.service')
+        await deleteIdentityProvider(data.id)
+        return { success: true }
+      }
+    )
+  })
+
+const setRedirectStyleInput = z.object({
+  id: identityProviderId,
+  style: z.enum(OIDC_REDIRECT_STYLES),
+})
+
+/**
+ * Switch which callback URL a provider sends as its redirect URI. Existing
+ * providers keep the legacy URL their IdP already has until an admin moves
+ * them, after registering the new one at the IdP.
+ */
+export const setIdentityProviderRedirectStyleFn = createServerFn({ method: 'POST' })
+  .validator(setRedirectStyleInput)
+  .handler(async ({ data }) => {
+    const auth = await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+    const { listIdentityProviders, setIdentityProviderRedirectStyle } =
+      await import('@/lib/server/domains/settings/identity-providers.service')
+    const prior = (await listIdentityProviders()).find((p) => p.id === data.id)
+    if (!prior) {
+      throw new ValidationError('IDP_NOT_FOUND', 'Identity provider not found.')
+    }
+
+    return withAuditEvent(
+      {
+        event: 'idp.updated',
+        actor: actorFromAuth(auth),
+        target: { type: 'identity_provider', id: prior.id },
+        before: { redirectStyle: prior.redirectStyle },
+        after: { redirectStyle: data.style },
+        headers: getRequestHeaders(),
+      },
+      async () => {
+        const saved = await setIdentityProviderRedirectStyle(prior.id, data.style)
+        if (!saved) throw new ValidationError('IDP_NOT_FOUND', 'Identity provider not found.')
+        return saved
+      }
+    )
+  })
+
+const saveIdentityProviderLogoInput = z.object({
+  providerId: identityProviderId,
+  key: z.string().min(1).max(512),
+})
+
+/**
+ * Persist the S3 key of a freshly-uploaded provider logo. The client PUTs the
+ * image to the presigned URL from `getIdentityProviderLogoUploadUrlFn` first,
+ * then calls this with the returned key. The service deletes any prior object.
+ */
+export const saveIdentityProviderLogoFn = createServerFn({ method: 'POST' })
+  .validator(saveIdentityProviderLogoInput)
+  .handler(async ({ data }) => {
+    const auth = await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+    return withAuditEvent(
+      {
+        event: 'idp.updated',
+        actor: actorFromAuth(auth),
+        target: { type: 'identity_provider', id: data.providerId },
+        after: { logo: 'set' },
+        headers: getRequestHeaders(),
+      },
+      async () => {
+        const { saveIdentityProviderLogoKey } =
+          await import('@/lib/server/domains/settings/identity-provider-logo.service')
+        return saveIdentityProviderLogoKey(data.providerId, data.key)
+      }
+    )
+  })
+
+const deleteIdentityProviderLogoInput = z.object({ providerId: identityProviderId })
+
+/** Remove a provider's logo (S3 object + key). */
+export const deleteIdentityProviderLogoFn = createServerFn({ method: 'POST' })
+  .validator(deleteIdentityProviderLogoInput)
+  .handler(async ({ data }) => {
+    const auth = await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+    return withAuditEvent(
+      {
+        event: 'idp.updated',
+        actor: actorFromAuth(auth),
+        target: { type: 'identity_provider', id: data.providerId },
+        after: { logo: 'cleared' },
+        headers: getRequestHeaders(),
+      },
+      async () => {
+        const { deleteIdentityProviderLogoKey } =
+          await import('@/lib/server/domains/settings/identity-provider-logo.service')
+        return deleteIdentityProviderLogoKey(data.providerId)
+      }
+    )
+  })
+
+const setProviderCredentialsInput = z.object({
+  id: identityProviderId,
+  // Trim BEFORE min(1) so a whitespace-only secret is rejected, not saved as an
+  // empty credential that still reads as `configured`.
+  clientSecret: z.string().trim().min(1).max(2048),
+})
+
+/**
+ * Persist a provider's IdP-issued client secret to `platform_credentials`
+ * at key `auth_<registrationId>` (the auth runtime reads the secret from
+ * there; clientId / discoveryUrl come from the provider row). The secret is
+ * a connection-affecting field, so stamp `detailsChangedAt` on the provider
+ * to invalidate any prior test sign-in until the admin re-tests.
+ */
+export const setProviderCredentialsFn = createServerFn({ method: 'POST' })
+  .validator(setProviderCredentialsInput)
+  .handler(async ({ data }) => {
+    const auth = await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+
+    const { listIdentityProviders, stampDetailsChanged } =
+      await import('@/lib/server/domains/settings/identity-providers.service')
+    const provider = (await listIdentityProviders()).find((p) => p.id === data.id)
+    if (!provider) {
+      throw new ValidationError('IDP_NOT_FOUND', 'Identity provider not found.')
+    }
+
+    return withAuditEvent(
+      {
+        event: 'idp.credentials.changed',
+        actor: actorFromAuth(auth),
+        target: { type: 'identity_provider', id: provider.id },
+        metadata: { field: 'clientSecret', action: 'set' },
+        headers: getRequestHeaders(),
+      },
+      async () => {
+        const { savePlatformCredentials } =
+          await import('@/lib/server/domains/platform-credentials/platform-credential.service')
+        const { AUTH_CREDENTIAL_PREFIX } = await import('@/lib/server/auth/auth-providers')
+        await savePlatformCredentials({
+          integrationType: `${AUTH_CREDENTIAL_PREFIX}${provider.registrationId}`,
+          credentials: { clientSecret: data.clientSecret.trim() },
+          principalId: auth.principal.id,
+        })
+        await stampDetailsChanged(provider.id)
+        return { success: true }
+      }
+    )
+  })
+
+const addProviderDomainInput = z.object({
+  providerId: identityProviderId,
+  name: z.string().min(1).max(253),
+})
+
+/**
+ * Insert a pending verified-domain row linked to `providerId`. Idempotent
+ * on `name` (globally unique); a previously-unlinked domain is adopted by
+ * the provider. Normalisation runs through the shared `verifiableDomain`
+ * transformer (reserved suffixes, IP literals, IDN labels rejected).
+ */
+export const addProviderDomainFn = createServerFn({ method: 'POST' })
+  .validator(addProviderDomainInput)
+  .handler(async ({ data }) => {
+    await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+
+    const { verifiableDomain } = await import('@/lib/server/auth/normalize-domain')
+    const parsed = verifiableDomain.safeParse(data.name)
+    if (!parsed.success) {
+      throw new ValidationError(
+        'INVALID_DOMAIN',
+        parsed.error.issues[0]?.message ?? 'Invalid domain'
+      )
+    }
+
+    const { insertVerifiedDomain } = await import('@/lib/server/domains/settings/settings.service')
+    return insertVerifiedDomain(parsed.data, data.providerId)
+  })
+
+const verifyProviderDomainInput = z.object({
+  providerId: identityProviderId,
+  id: verifiedDomainId,
+})
+
+/**
+ * Resolve the DNS TXT record for a provider's pending domain and stamp
+ * `verified_at` on match. Provider-scoped: the domain must belong to
+ * `providerId`. Per-domain rate-limited; never throws on lookup failure —
+ * returns a structured `reason`.
+ */
+export const verifyProviderDomainFn = createServerFn({ method: 'POST' })
+  .validator(verifyProviderDomainInput)
+  .handler(async ({ data }): Promise<VerifyDomainResult> => {
+    const auth = await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+
+    const { getWorkspaceSettings, stampVerifiedDomain } =
+      await import('@/lib/server/domains/settings/settings.service')
+    const workspace = await getWorkspaceSettings()
+    if (!workspace?.settings?.id) {
+      return { verified: false, reason: 'no-pending-domain' }
+    }
+    const dom = workspace.verifiedDomains.find(
+      (d) => d.id === data.id && d.providerId === data.providerId
+    )
+    if (!dom) {
+      return { verified: false, reason: 'no-pending-domain' }
+    }
+    await assertVerifyDomainRateLimit(workspace.settings.id, dom.id)
+
+    const { checkSsoDomainOwnership } =
+      await import('@/lib/server/domains/domain-proof/sso-domain-check')
+    const check = await checkSsoDomainOwnership(dom)
+    if (!check.ok) {
+      return { verified: false, reason: check.reason }
+    }
+
+    const verifiedAt = new Date().toISOString()
+    try {
+      await stampVerifiedDomain({
+        id: dom.id,
+        expectedToken: dom.verificationToken,
+        verifiedAt,
+      })
+    } catch (err) {
+      const code = (err as { code?: string }).code
+      if (code === 'STALE_VERIFICATION_TOKEN') {
+        return { verified: false, reason: 'lookup-failed' }
+      }
+      throw err
+    }
+    return {
+      verified: true,
+      verifiedAt,
+      via: check.via === 'dns' ? 'dns' : shownProofSource(check.via, auth.permissions),
+    }
+  })
+
+/**
+ * The single sign-on domains another proof already covers, by domain id, with
+ * the source that covers each. A pending one shows that note instead of the
+ * TXT record, and a verified one says where its proof came from.
+ */
+export const getSsoDomainProofsFn = createServerFn({ method: 'GET' }).handler(
+  async (): Promise<Record<string, ShownProofSource>> => {
+    const auth = await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+    const { listSignInDomainSummaries } =
+      await import('@/lib/server/domains/domain-proof/domains-overview')
+    const proofs: Record<string, ShownProofSource> = {}
+    for (const d of await listSignInDomainSummaries(auth.permissions)) {
+      if (d.provenBy) proofs[d.id] = d.provenBy
+    }
+    return proofs
+  }
+)
+
+const setDomainEnforcedInput = z.object({
+  id: verifiedDomainId,
+  enforced: z.boolean(),
+})
+
+/**
+ * Flip a provider-scoped domain's `enforced` flag. Enabling preconditions
+ * key off the OWNING provider's freshness (`detailsChangedAt` /
+ * `lastSuccessfulTestAt`):
+ *  1. A successful TEST through this provider since its last details change —
+ *     `isSsoEnforcementUnlocked(provider, null)`. We pass `null` (no team-wide
+ *     sign-in fallback) deliberately: `principal.lastSsoSignInAt` is
+ *     provider-independent, so accepting it would let a sign-in via provider B
+ *     unlock never-validated provider A.
+ *  2. Active recovery codes generated — the break-glass to sign back in if the
+ *     IdP becomes unavailable. Password / magic-link are hard-bound off for
+ *     enforced-domain emails, so recovery codes are the only way back.
+ * Disabling skips both.
+ */
+export const setDomainEnforcedFn = createServerFn({ method: 'POST' })
+  .validator(setDomainEnforcedInput)
+  .handler(async ({ data }) => {
+    const auth = await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+
+    const { listIdentityProviders } =
+      await import('@/lib/server/domains/settings/identity-providers.service')
+    const { setVerifiedDomainEnforced } =
+      await import('@/lib/server/domains/settings/settings.service')
+
+    // Load providers for the owning provider's freshness gate + the audit
+    // before-snapshot.
+    const providers = await listIdentityProviders()
+
+    let owningProvider: (typeof providers)[number] | undefined
+    let dom: (typeof providers)[number]['domains'][number] | undefined
+    for (const p of providers) {
+      const match = p.domains.find((d) => d.id === data.id)
+      if (match) {
+        owningProvider = p
+        dom = match
+        break
+      }
+    }
+
+    return withAuditEvent(
+      {
+        event: data.enforced ? 'idp.domain.enforced' : 'idp.domain.unenforced',
+        actor: actorFromAuth(auth),
+        target: { type: 'sso_verified_domain', id: data.id },
+        before: dom ? { enforced: dom.enforced } : null,
+        after: { enforced: data.enforced },
+        metadata: owningProvider ? { providerId: owningProvider.id } : undefined,
+        headers: getRequestHeaders(),
+      },
+      async () => {
+        if (data.enforced) {
+          if (!owningProvider) {
+            throw new ValidationError(
+              'VERIFIED_DOMAIN_NOT_FOUND',
+              'Domain is not linked to an identity provider.'
+            )
+          }
+          const { isSsoEnforcementUnlocked } = await import('@/lib/server/auth/sso-gates')
+          // Pass null (no team-wide sign-in fallback): enforcement requires a
+          // successful TEST through THIS provider. `principal.lastSsoSignInAt`
+          // is provider-independent, so accepting it would let a sign-in via
+          // provider B unlock never-validated provider A.
+          if (!isSsoEnforcementUnlocked(owningProvider, null)) {
+            throw new ForbiddenError(
+              'SSO_TEST_REQUIRED',
+              'Run a successful test sign-in before enabling enforcement.'
+            )
+          }
+
+          const { assertBreakGlassAvailable } =
+            await import('@/lib/server/auth/sign-in-method-availability')
+          await assertBreakGlassAvailable()
+        }
+
+        return setVerifiedDomainEnforced(data.id, data.enforced)
+      }
+    )
+  })
+
+/**
+ * Read `scopes_supported` from a provider's discovery document.
+ *
+ * Backs the editor's inline scope validation — the check that would have caught
+ * the reported failure at configuration time instead of as an opaque
+ * `invalid_scope` after a round trip to the IdP.
+ *
+ * Returns null when the document is unreachable or omits the field, which the
+ * caller must treat as "unknown" rather than "nothing supported": the field is
+ * RECOMMENDED, not required.
+ */
+export const fetchDiscoveryScopesFn = createServerFn({ method: 'POST' })
+  .validator(z.object({ discoveryUrl: httpsUrl }))
+  .handler(async ({ data }): Promise<{ scopesSupported: string[] | null }> => {
+    await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+    try {
+      // Same SSRF guard the connection test uses: validated, IP-pinned, no
+      // redirects, so an admin-supplied URL cannot probe the internal network.
+      const { safeFetch } = await import('@/lib/server/content/ssrf-guard')
+      const res = await safeFetch(data.discoveryUrl, { timeoutMs: 5000 })
+      if (!res.ok) return { scopesSupported: null }
+      const doc = (await res.json()) as { scopes_supported?: unknown }
+      if (!Array.isArray(doc.scopes_supported)) return { scopesSupported: null }
+      return {
+        scopesSupported: doc.scopes_supported.filter((s): s is string => typeof s === 'string'),
+      }
+    } catch {
+      // Unreachable is not an error the admin needs to act on here; the
+      // connection test is where a broken discovery URL gets reported.
+      return { scopesSupported: null }
+    }
+  })
+
+/**
+ * Declared LAST deliberately. `sso-domain-guards.test.ts` resolves these
+ * handlers by declaration order (`ssoHandlers[9]`), so inserting a function
+ * mid-file silently repoints every later index at the wrong handler — the
+ * failure reads as a function returning someone else's shape, not as an
+ * ordering problem. Append here; do not insert above.
+ */
+/**
+ * How many identities sign in through this provider. `deleteIdentityProviderFn`
+ * refuses while any exist (removal would orphan them), so the Remove control
+ * states the count up front instead of surfacing it as a failed delete.
+ */
+export const getProviderAccountCountFn = createServerFn({ method: 'GET' })
+  .validator(z.object({ id: identityProviderId }))
+  .handler(async ({ data }) => {
+    await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+    const { countProviderAccounts } =
+      await import('@/lib/server/domains/settings/identity-provider-accounts')
+    return { count: await countProviderAccounts(data.id) }
+  })
+
+/**
+ * The teammates who sign in through this provider and whether each holds
+ * admin-level access, so the role rules can warn before a change that could
+ * lock every admin out.
+ */
+export const listProviderAdminsFn = createServerFn({ method: 'GET' })
+  .validator(z.object({ providerId: identityProviderId }))
+  .handler(async ({ data }) => {
+    const auth = await requireAuth({ permission: PERMISSIONS.AUTH_MANAGE })
+    const { listProviderAdmins } =
+      await import('@/lib/server/domains/settings/identity-provider-accounts')
+    return listProviderAdmins(data.providerId, auth.principal.id)
+  })

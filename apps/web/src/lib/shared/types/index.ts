@@ -1,0 +1,87 @@
+/**
+ * Centralized type exports for the lib layer.
+ *
+ * Import types from here to avoid circular dependencies:
+ *   import type { InboxFilters, PostDetails } from '@/lib/shared/types'
+ */
+
+// Filter types
+export type {
+  InboxFilters,
+  PublicFeedbackFilters,
+  RoadmapFilters,
+  SuggestionsFilters,
+  UsersFilters,
+} from './filters'
+
+// Inbox/post detail types
+export type {
+  PinnedComment,
+  PostCommentReaction,
+  CommentWithReplies,
+  PostDetails,
+  CurrentUser,
+  MergedPostItem,
+} from './inbox'
+
+// Post domain types
+export type {
+  CreatePostInput,
+  AdminEditPostInput,
+  PublicPostListItem,
+  InboxFilterCounts,
+} from './posts'
+
+// User domain types
+export type {
+  UserSegmentSummary,
+  PortalUserListParams,
+  PortalUserListItemView,
+  PortalUserListResultView,
+  PortalUserDetail,
+  EngagedPost,
+} from './users'
+
+// Subscription types
+export type { SubscriptionLevel } from './subscriptions'
+
+// Principal types
+export type { TeamMember } from './principals'
+
+// Board types
+export type { BoardWithStats, PublicBoardWithStats } from './boards'
+
+// Roadmap types
+export type {
+  RoadmapPost,
+  RoadmapPostListResult,
+  RoadmapPostsListResult,
+  RoadmapViewPost,
+} from './roadmaps'
+
+// Webhook types
+export type { Webhook } from './webhooks'
+
+// API key types
+export type { ApiKey } from './api-keys'
+
+// Settings types
+export type { FeatureFlags, ProductId } from './settings'
+export {
+  DEFAULT_FEATURE_FLAGS,
+  featureFlagsForUseCase,
+  enableFlagsForUseCase,
+  PRODUCT_DEFINITIONS,
+  getFirstEnabledAdminProductPath,
+  getProductFlagUpdate,
+  isProductEnabled,
+} from './settings'
+
+// Import types
+export type { ImportResult } from './import'
+
+// Activity types
+export type { ActivityType } from './activity'
+
+// Notification types
+export type { NotificationType } from './notifications'

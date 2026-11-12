@@ -1,0 +1,456 @@
+/**
+ * Input/Output types for PostService operations
+ */
+
+import type { Post, Board, BoardAccess, PostTag, TiptapContent } from '@/lib/server/db'
+import type {
+  ChangelogId,
+  PostId,
+  BoardId,
+  PostTagId,
+  PostStatusId,
+  PrincipalId,
+  PostCommentId,
+} from '@quackback/ids'
+import type { CommentReactionCount, CommentStatusChange } from '@/lib/shared'
+import type { InboxPostSort, WidenedSearch } from '@/lib/shared/types/filters'
+import type { PostSearchMode } from './post.search'
+
+/**
+ * Input for creating a new post
+ */
+export interface CreatePostInput {
+  boardId: BoardId
+  title: string
+  content?: string
+  contentJson?: TiptapContent | null
+  statusId?: PostStatusId
+  tagIds?: PostTagId[]
+  widgetMetadata?: Record<string, string>
+  /** Override creation timestamp (admin-only, for imports) */
+  createdAt?: Date
+  /** The team member who initiated this post on the customer's behalf. */
+  trackedByPrincipalId?: PrincipalId | null
+  /** Answers to the board's configured custom fields (boards.settings.customFields),
+   *  keyed by field key. Validated against the board's declaration on write. */
+  customFields?: Record<string, unknown>
+}
+
+/**
+ * Input for updating an existing post
+ */
+export interface UpdatePostInput {
+  title?: string
+  content?: string
+  contentJson?: TiptapContent | null
+  statusId?: PostStatusId
+  tagIds?: PostTagId[]
+  ownerPrincipalId?: PrincipalId | null
+  /** Target ship date for time-based roadmaps; null clears it. */
+  eta?: Date | null
+  /** Board pinning: true pins the post to lead its public board listing,
+   *  false unpins. Maps to posts.pinned_at. */
+  pinned?: boolean
+}
+
+/**
+ * Result of a vote operation
+ */
+export interface VoteResult {
+  /** Whether the user now has an active vote (true = voted, false = unvoted) */
+  voted: boolean
+  /** New vote count for the post */
+  voteCount: number
+}
+
+/**
+ * Input for changing post status
+ */
+export interface ChangeStatusInput {
+  postId: PostId
+  statusId: PostStatusId
+}
+
+/**
+ * Extended post with related data
+ */
+export interface PostWithDetails extends Post {
+  board: {
+    id: BoardId
+    name: string
+    slug: string
+  }
+  tags: Array<{
+    id: PostTagId
+    name: string
+    color: string
+  }>
+  commentCount: number
+  /** Pinned comment displayed as official response */
+  pinnedComment: PinnedComment | null
+  /** Author name resolved from member->user relation */
+  authorName: string | null
+  /** Author email resolved from member->user relation */
+  authorEmail: string | null
+}
+
+/**
+ * Public post list item for portal view
+ */
+export interface PublicPostListItem {
+  id: PostId
+  title: string
+  content: string
+  statusId: PostStatusId | null
+  voteCount: number
+  authorName: string | null
+  principalId: PrincipalId | null
+  createdAt: Date
+  commentCount: number
+  tags: Array<{ id: PostTagId; name: string; color: string }>
+  board?: { id: BoardId; name: string; slug: string }
+  moderationState?: 'published' | 'pending' | string
+  /** Newest published changelog entry announcing this post, if any. */
+  changelogEntry?: { id: ChangelogId; title: string } | null
+}
+
+/**
+ * Result for public post list queries
+ */
+export interface PublicPostListResult {
+  items: PublicPostListItem[]
+  total?: number
+  hasMore: boolean
+}
+
+/**
+ * Parameters for inbox post list query
+ */
+export interface InboxPostListParams {
+  boardIds?: BoardId[]
+  /** Filter by status IDs (legacy, prefer statusSlugs) */
+  statusIds?: PostStatusId[]
+  /** Filter by status slugs - uses indexed lookup */
+  statusSlugs?: string[]
+  tagIds?: PostTagId[]
+  /** Filter by segment IDs - posts whose author is in any of these segments */
+  segmentIds?: import('@quackback/ids').SegmentId[]
+  ownerId?: string | null
+  /** Filter to posts authored by this teammate. */
+  authorId?: PrincipalId
+  /** Filter to posts whose author user email matches (case-insensitive). */
+  authorEmail?: string
+  search?: string
+  dateFrom?: Date
+  dateTo?: Date
+  minVotes?: number
+  minComments?: number
+  /** Filter by team response state */
+  responded?: 'all' | 'responded' | 'unresponded'
+  updatedBefore?: Date
+  sort?: InboxPostSort
+  /** How loosely the search matches; see resolvePostSearchMode. Defaults to every word. */
+  searchMode?: PostSearchMode
+  /** Show only soft-deleted posts (within 30-day restorable window) */
+  showDeleted?: boolean
+  /** Leave out teammates' test ideas (API, MCP and Copilot reads). */
+  excludeTest?: boolean
+  cursor?: string
+  limit?: number
+}
+
+/**
+ * Result for inbox post list query
+ */
+export interface InboxPostListResult {
+  items: PostListItem[]
+  nextCursor: string | null
+  hasMore: boolean
+  /** Set when no post matched every word and the search was widened. */
+  searchMode?: WidenedSearch
+}
+
+/**
+ * Per-option counts for the admin inbox filter pane. Each map is keyed by the
+ * same id the filter UI uses (status slug, board/tag/segment id). Counts for
+ * a dimension omit that dimension's own filter so an unselected option shows
+ * how many posts would newly match if it were selected, given every other
+ * currently applied filter.
+ */
+export interface InboxFilterCounts {
+  statuses: Record<string, number>
+  boards: Record<string, number>
+  tags: Record<string, number>
+  segments: Record<string, number>
+  responded: { responded: number; unresponded: number }
+  deleted: number
+}
+
+/**
+ * Post list item with board, tags, and comment count
+ */
+export interface PostListItem extends Post {
+  board: Pick<Board, 'id' | 'name' | 'slug'>
+  tags: Array<Pick<PostTag, 'id' | 'name' | 'color'> & { autoTagged: boolean }>
+  commentCount: number
+  /** Author name resolved from member->user relation */
+  authorName: string | null
+}
+
+/**
+ * Post data for export
+ */
+export interface PostForExport {
+  id: string
+  title: string
+  content: string
+  statusId: PostStatusId | null
+  voteCount: number
+  authorName: string | null
+  authorEmail: string | null
+  createdAt: Date
+  updatedAt: Date
+  board: { id: string; name: string; slug: string }
+  tags: Array<{ id: string; name: string; color: string }>
+  statusDetails?: {
+    name: string
+    color: string
+  }
+}
+
+/**
+ * Post for roadmap view
+ */
+export interface RoadmapPost {
+  id: string
+  title: string
+  statusId: PostStatusId | null
+  voteCount: number
+  board: { id: string; name: string; slug: string }
+}
+
+/**
+ * Paginated result for roadmap posts
+ */
+export interface RoadmapPostListResult {
+  items: RoadmapPost[]
+  total?: number
+  hasMore: boolean
+}
+
+/**
+ * Pinned comment serving as the official response
+ */
+export interface PinnedComment {
+  id: PostCommentId
+  content: string
+  contentJson?: TiptapContent | null
+  authorName: string | null
+  principalId: PrincipalId | null
+  avatarUrl: string | null
+  createdAt: Date
+  isTeamMember: boolean
+}
+
+/**
+ * Public comment for portal view
+ */
+export interface PublicComment {
+  id: PostCommentId
+  content: string
+  contentJson?: TiptapContent | null
+  authorName: string | null
+  principalId: string | null
+  createdAt: Date
+  deletedAt: Date | null
+  isRemovedByTeam: boolean
+  parentId: PostCommentId | null
+  isTeamMember: boolean
+  isPrivate: boolean
+  isEdited: boolean
+  avatarUrl: string | null
+  statusChange?: CommentStatusChange | null
+  moderationState?: 'published' | 'pending' | string | null
+  replies: PublicComment[]
+  reactions: CommentReactionCount[]
+}
+
+/**
+ * Public post detail for portal view
+ */
+export interface PublicPostDetail {
+  id: string
+  title: string
+  content: string
+  contentJson: TiptapContent | null
+  statusId: PostStatusId | null
+  voteCount: number
+  authorName: string | null
+  principalId: PrincipalId | null
+  authorAvatarUrl: string | null
+  createdAt: Date
+  /** Target ship date (time-based roadmap); null when unset. */
+  eta: Date | string | null
+  board: { id: string; name: string; slug: string }
+  /**
+   * The board's per-action access matrix. Server-only — `fetchPublicPostDetail`
+   * uses it to compute the viewer's `canVote`/`canComment` capability and then
+   * strips it before serializing to the client (segment ids must not leak).
+   */
+  boardAccess: BoardAccess
+  tags: Array<{ id: string; name: string; color: string }>
+  /**
+   * First page of root comments (each carrying its full reply subtree).
+   * Comments are keyset-paginated by TOP-LEVEL comment on `(created_at, id)`
+   * ascending — bounding the number of roots bounds the payload, since reply
+   * chains are shallow. `commentsHasMore` / `commentsNextCursor` drive the
+   * portal/widget "show more comments" affordance.
+   */
+  comments: PublicComment[]
+  /** Whether more root comments exist beyond this page. */
+  commentsHasMore: boolean
+  /** Opaque keyset cursor for the next page of roots, or null when exhausted. */
+  commentsNextCursor: string | null
+  /** Total live root-comment count (drives the "show N more" label). */
+  commentsTotalRootCount: number
+  /** Pinned comment as official response */
+  pinnedComment: PinnedComment | null
+  /** ID of the pinned comment (for UI to identify which comment is pinned) */
+  pinnedCommentId: PostCommentId | null
+  /** Whether comments are locked (portal users can't comment) */
+  isCommentsLocked: boolean
+  moderationState?: 'published' | 'pending' | string
+}
+
+/**
+ * Keyset cursor over root comments, encoded as `<createdAtISO>|<uuid>`.
+ * `createdAt` breaks ties deterministically with the comment id so pages
+ * never overlap or skip under the `(created_at, id)` ordering.
+ */
+export interface CommentCursor {
+  createdAt: string
+  id: string
+}
+
+/**
+ * Result of checking edit/delete permission
+ */
+export interface PermissionCheckResult {
+  allowed: boolean
+  reason?: string
+}
+
+/**
+ * Input for user editing their own post (portal)
+ */
+export interface UserEditPostInput {
+  title: string
+  content: string
+  contentJson?: TiptapContent | null
+}
+
+/**
+ * Input for admin editing a post (includes status and tags)
+ */
+export interface AdminEditPostInput {
+  postId: PostId
+  title: string
+  content: string
+  contentJson?: TiptapContent | null
+  statusId?: PostStatusId
+  tagIds: PostTagId[]
+}
+
+/**
+ * Post edit history entry
+ */
+export interface PostEditHistoryEntry {
+  id: string
+  postId: PostId
+  editorPrincipalId: PrincipalId
+  editorName?: string | null
+  previousTitle: string
+  previousContent: string
+  previousContentJson?: unknown
+  createdAt: Date
+}
+
+/**
+ * Result of creating a post - includes board slug for event building
+ */
+export interface CreatePostResult extends Post {
+  boardSlug: string
+}
+
+/**
+ * Result of changing post status - includes status info for event building
+ */
+export interface ChangeStatusResult extends Post {
+  boardSlug: string
+  previousStatus: string
+  newStatus: string
+  /** The post moved into a complete status from one that was not: something shipped. */
+  enteredComplete: boolean
+}
+
+/**
+ * Result of changing post board
+ */
+export type ChangeBoardResult = Post
+
+// ============================================
+// Merge/Deduplication Types
+// ============================================
+
+/**
+ * Input for merging a duplicate post into a canonical post
+ */
+export interface MergePostInput {
+  /** The post to mark as a duplicate */
+  duplicatePostId: PostId
+  /** The canonical post to merge into */
+  canonicalPostId: PostId
+}
+
+/**
+ * Result of a merge operation
+ */
+export interface MergePostResult {
+  /** The updated canonical post with recalculated vote count */
+  canonicalPost: { id: PostId; voteCount: number }
+  /** The duplicate post that was merged */
+  duplicatePost: { id: PostId }
+}
+
+/**
+ * Result of an unmerge operation
+ */
+export interface UnmergePostResult {
+  /** The post that was unmerged (restored to independent state) */
+  post: { id: PostId }
+  /** The canonical post with recalculated vote count */
+  canonicalPost: { id: PostId; voteCount: number }
+}
+
+/**
+ * Summary of a merged (duplicate) post shown on the canonical post detail
+ */
+export interface MergedPostSummary {
+  id: PostId
+  title: string
+  voteCount: number
+  authorName: string | null
+  createdAt: Date
+  mergedAt: Date
+}
+
+/**
+ * Merge info for a post that has been merged into another
+ */
+export interface PostMergeInfo {
+  /** The canonical post this was merged into */
+  canonicalPostId: PostId
+  canonicalPostTitle: string
+  canonicalPostBoardSlug: string
+  mergedAt: Date
+}

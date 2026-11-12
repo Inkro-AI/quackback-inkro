@@ -1,0 +1,137 @@
+import { createFileRoute } from '@tanstack/react-router'
+import { z } from 'zod'
+import { withApiKeyAuth } from '@/lib/server/domains/api/auth'
+import {
+  successResponse,
+  noContentResponse,
+  badRequestResponse,
+  handleDomainError,
+} from '@/lib/server/domains/api/responses'
+import { parseTypeId, parseTypeIdArray } from '@/lib/server/domains/api/validation'
+import {
+  getChangelogById,
+  updateChangelog,
+  deleteChangelog,
+} from '@/lib/server/domains/changelog/changelog.service'
+import type { PublishState } from '@/lib/shared/schemas/changelog'
+import { PERMISSIONS } from '@/lib/shared/permissions'
+import type { ChangelogId, PostId } from '@quackback/ids'
+import { formatChangelogResponse } from './-serialize'
+
+// Input validation schema
+const updateChangelogSchema = z.object({
+  title: z.string().min(1).max(200).optional(),
+  content: z.string().min(1).optional(),
+  publishedAt: z.string().datetime().nullable().optional(),
+  displayDate: z.string().datetime().nullable().optional(),
+  linkedPostIds: z.array(z.string()).optional(),
+})
+
+export const Route = createFileRoute('/api/v1/changelog/$entryId')({
+  server: {
+    handlers: {
+      /**
+       * GET /api/v1/changelog/:entryId
+       * Get a single changelog entry by ID
+       */
+      GET: async ({ request, params }) => {
+        try {
+          await withApiKeyAuth(request, { permission: PERMISSIONS.CHANGELOG_VIEW_DRAFT })
+
+          const entryId = parseTypeId<ChangelogId>(
+            params.entryId,
+            'changelog',
+            'changelog entry ID'
+          )
+
+          const entry = await getChangelogById(entryId)
+          return successResponse(formatChangelogResponse(entry))
+        } catch (error) {
+          return handleDomainError(error)
+        }
+      },
+
+      /**
+       * PATCH /api/v1/changelog/:entryId
+       * Update a changelog entry
+       */
+      PATCH: async ({ request, params }) => {
+        try {
+          await withApiKeyAuth(request, { permission: PERMISSIONS.CHANGELOG_MANAGE })
+
+          const entryId = parseTypeId<ChangelogId>(
+            params.entryId,
+            'changelog',
+            'changelog entry ID'
+          )
+
+          const body = await request.json()
+          const parsed = updateChangelogSchema.safeParse(body)
+
+          if (!parsed.success) {
+            return badRequestResponse('Invalid request body', {
+              errors: parsed.error.flatten().fieldErrors,
+            })
+          }
+
+          // Convert publishedAt to PublishState, preserving exact timestamps
+          let publishState: PublishState | undefined
+          if (parsed.data.publishedAt !== undefined) {
+            if (parsed.data.publishedAt === null) {
+              publishState = { type: 'draft' }
+            } else {
+              const publishDate = new Date(parsed.data.publishedAt)
+              publishState =
+                publishDate > new Date()
+                  ? { type: 'scheduled', publishAt: publishDate }
+                  : { type: 'published', publishAt: publishDate }
+            }
+          }
+
+          const linkedPostIds = parseTypeIdArray<PostId>(
+            parsed.data.linkedPostIds,
+            'post',
+            'linked post IDs'
+          )
+
+          const updated = await updateChangelog(entryId, {
+            title: parsed.data.title,
+            content: parsed.data.content,
+            ...(publishState && { publishState }),
+            ...(parsed.data.displayDate !== undefined && {
+              displayDate:
+                parsed.data.displayDate === null ? null : new Date(parsed.data.displayDate),
+            }),
+            ...(linkedPostIds !== undefined && { linkedPostIds }),
+          })
+
+          return successResponse(formatChangelogResponse(updated))
+        } catch (error) {
+          return handleDomainError(error)
+        }
+      },
+
+      /**
+       * DELETE /api/v1/changelog/:entryId
+       * Delete a changelog entry
+       */
+      DELETE: async ({ request, params }) => {
+        try {
+          // Soft delete (deleteChangelog sets deletedAt) — team OK.
+          await withApiKeyAuth(request, { permission: PERMISSIONS.CHANGELOG_MANAGE })
+
+          const entryId = parseTypeId<ChangelogId>(
+            params.entryId,
+            'changelog',
+            'changelog entry ID'
+          )
+
+          await deleteChangelog(entryId)
+          return noContentResponse()
+        } catch (error) {
+          return handleDomainError(error)
+        }
+      },
+    },
+  },
+})

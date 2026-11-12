@@ -1,0 +1,496 @@
+import { queryOptions } from '@tanstack/react-query'
+import type { PostId, RoadmapId } from '@quackback/ids'
+import type { AdminPostPanel } from '@/lib/server/domains/posts/post.admin-panels'
+import {
+  fetchTagsList,
+  fetchStatusesList,
+  fetchTeamMembers,
+  searchPeopleFn,
+  fetchOnboardingStatus,
+  fetchIntegrationsList,
+  fetchIntegrationCatalog,
+  fetchIntegrationByType,
+  listPortalUsersFn,
+  listSegmentsFn,
+  listUserAttributesFn,
+} from '@/lib/server/functions/admin'
+import { fetchBoardsFn, fetchBoardsWithCountsFn } from '@/lib/server/functions/boards'
+import { fetchPlatformCredentialsMaskedFn } from '@/lib/server/functions/platform-credentials'
+import {
+  fetchAuthProviderStatusFn,
+  fetchAuthProviderCredentialsMaskedFn,
+} from '@/lib/server/functions/auth-provider-credentials'
+import { listAuditEventsFn } from '@/lib/server/functions/audit-log'
+import { listCompanyAttributesFn } from '@/lib/server/functions/company-attributes'
+import { listRecoveryCodesFn } from '@/lib/server/functions/recovery-codes'
+import { getModerationStatus } from '@/lib/server/functions/moderation'
+import { fetchApiKeys } from '@/lib/server/functions/api-keys'
+import { fetchWebhooks } from '@/lib/server/functions/webhooks'
+import { fetchRoadmaps } from '@/lib/server/functions/roadmaps'
+import { fetchPostWithDetails, fetchPostVotersFn } from '@/lib/server/functions/posts'
+import { fetchMergePreviewFn } from '@/lib/server/functions/post-merge'
+import { fetchPublicStatuses } from '@/lib/server/functions/portal'
+import type { PortalUserListParams } from '@/lib/shared/types'
+import { mergeSuggestionQueries } from '@/lib/client/queries/signals'
+import { postOwnerQueries } from '@/lib/client/queries/post-owner'
+import { postExternalLinksQuery } from '@/lib/client/hooks/use-post-external-links-query'
+import { customerContextQuery } from '@/lib/client/queries/customer-context'
+import { readsToLoad, seedReads } from '@/lib/client/queries/read-batch'
+
+/**
+ * The queries behind the panels beside a post in the admin post modal, by the
+ * name the post detail request loads each under (see post.admin-panels). The
+ * customer-context query is keyed by the author's email, unknown until the
+ * post has loaded once.
+ */
+function postPanelQueries(postId: PostId, authorEmail: string | null | undefined) {
+  return {
+    voters: adminQueries.postVoters(postId),
+    mergeSuggestions: mergeSuggestionQueries.forPost(postId),
+    externalLinks: postExternalLinksQuery(postId),
+    ownerCandidates: postOwnerQueries.candidates(),
+    customerContext: authorEmail ? customerContextQuery(authorEmail) : null,
+  } satisfies Record<AdminPostPanel, unknown>
+}
+
+/**
+ * Query options factory for admin routes.
+ * Uses server functions (createServerFn) to keep database code server-only.
+ * These are used with ensureQueryData() in loaders and useSuspenseQuery() in components.
+ *
+ * NOTE (QC-1): the inbox posts list is no longer defined here. Its loader
+ * prefetch and its renderer now share ONE infinite-query definition —
+ * `inboxPostsInfiniteOptions` in lib/client/hooks/use-inbox-query.ts — so post
+ * mutations that invalidate `inboxKeys.lists()` reach the cache the UI renders.
+ */
+export const adminQueries = {
+  /**
+   * List all boards
+   */
+  boards: () =>
+    queryOptions({
+      queryKey: ['admin', 'boards'],
+      queryFn: () => fetchBoardsFn(),
+      staleTime: 5 * 60 * 1000, // 5min - reference data, rarely changes during session
+      // Date coercion happens per observer, so the cache holds one raw copy
+      // shared with boardsForSettings below.
+      select: (data) =>
+        data.map((b) => ({
+          ...b,
+          createdAt: new Date(b.createdAt),
+          updatedAt: new Date(b.updatedAt),
+        })),
+    }),
+
+  /**
+   * The same board list as `boards`, without the Date coercion.
+   *
+   * Shares `boards`' query key deliberately: both now resolve to the identical
+   * zero-argument `fetchBoardsFn`, so a separate key meant fetching the same
+   * payload twice and holding two copies whenever a screen mounted both (the
+   * post modal lives in the admin root layout, so `?post=` on a settings screen
+   * did exactly that). Invalidating either name refreshes both.
+   */
+  boardsForSettings: () =>
+    queryOptions({
+      queryKey: ['admin', 'boards'],
+      queryFn: () => fetchBoardsFn(),
+      staleTime: 5 * 60 * 1000, // 5min - reference data
+    }),
+
+  /**
+   * Board list with post counts for the settings hub. Isolated query key
+   * so counting does not inflate the app-wide `['admin', 'boards']` cache.
+   */
+  boardsWithCounts: () =>
+    queryOptions({
+      queryKey: ['admin', 'boards', 'with-counts'],
+      queryFn: () => fetchBoardsWithCountsFn(),
+      staleTime: 5 * 60 * 1000,
+    }),
+
+  /**
+   * List all tags
+   */
+  tags: () =>
+    queryOptions({
+      queryKey: ['admin', 'tags'],
+      queryFn: () => fetchTagsList(),
+      staleTime: 5 * 60 * 1000, // 5min - reference data, rarely changes during session
+    }),
+
+  /**
+   * List all statuses
+   */
+  statuses: () =>
+    queryOptions({
+      queryKey: ['admin', 'statuses'],
+      queryFn: () => fetchStatusesList(),
+      staleTime: 5 * 60 * 1000, // 5min - reference data, rarely changes during session
+    }),
+
+  /**
+   * List all roadmaps
+   */
+  roadmaps: () =>
+    queryOptions({
+      queryKey: ['admin', 'roadmaps'],
+      queryFn: async () => {
+        const data = await fetchRoadmaps()
+        return data.map((r) => ({
+          ...r,
+          id: r.id as RoadmapId, // Server serializes to string, cast back to branded type
+          createdAt: new Date(r.createdAt),
+          updatedAt: new Date(r.updatedAt),
+        }))
+      },
+      staleTime: 5 * 60 * 1000, // 5min - reference data, rarely changes during session
+    }),
+
+  /**
+   * List all team members
+   */
+  teamMembers: () =>
+    queryOptions({
+      queryKey: ['admin', 'team', 'members'],
+      queryFn: () => fetchTeamMembers(),
+      staleTime: 5 * 60 * 1000, // 5min - reference data for filters/assignments
+    }),
+
+  /**
+   * Search people (portal users included) for on-behalf typeaheads:
+   * the author selector and the proxy-vote picker.
+   */
+  searchPeople: (params: { search?: string; limit?: number }) =>
+    queryOptions({
+      queryKey: ['admin', 'people', 'search', params],
+      queryFn: () => searchPeopleFn({ data: params }),
+      staleTime: 30 * 1000,
+    }),
+
+  /**
+   * List portal users with filtering
+   */
+  portalUsers: (filters: PortalUserListParams) =>
+    queryOptions({
+      queryKey: ['admin', 'users', filters],
+      queryFn: () =>
+        listPortalUsersFn({
+          data: {
+            search: filters.search,
+            verified: filters.verified,
+            dateFrom: filters.dateFrom?.toISOString(),
+            dateTo: filters.dateTo?.toISOString(),
+            sort: filters.sort,
+            page: filters.page,
+            limit: filters.limit,
+            segmentIds: filters.segmentIds,
+            lifecycle: filters.lifecycle,
+          },
+        }),
+      staleTime: 30 * 1000,
+    }),
+
+  /**
+   * List all segments with member counts
+   */
+  segments: () =>
+    queryOptions({
+      queryKey: ['admin', 'segments'],
+      queryFn: () => listSegmentsFn(),
+      staleTime: 30 * 1000,
+    }),
+
+  /**
+   * Get onboarding status
+   */
+  onboardingStatus: () =>
+    queryOptions({
+      queryKey: ['admin', 'onboarding'],
+      queryFn: () => fetchOnboardingStatus(),
+      staleTime: 0,
+      refetchOnWindowFocus: true,
+    }),
+
+  /**
+   * Get roadmap statuses (statuses marked for roadmap display)
+   */
+  roadmapStatuses: () =>
+    queryOptions({
+      queryKey: ['admin', 'roadmap', 'statuses'],
+      queryFn: async () => {
+        const statuses = await fetchPublicStatuses()
+        return statuses.filter((s) => s.showOnRoadmap)
+      },
+      staleTime: 5 * 60 * 1000, // 5min - reference data
+    }),
+
+  /**
+   * Integration catalog (includes dynamic availability based on platform credentials)
+   */
+  integrationCatalog: () =>
+    queryOptions({
+      queryKey: ['admin', 'integrationCatalog'],
+      queryFn: () => fetchIntegrationCatalog(),
+      staleTime: 5 * 60 * 1000, // 5min - availability changes when credentials are configured
+    }),
+
+  /**
+   * Masked platform credentials for an integration type
+   */
+  platformCredentials: (type: string) =>
+    queryOptions({
+      queryKey: ['admin', 'platformCredentials', type],
+      queryFn: () => fetchPlatformCredentialsMaskedFn({ data: { integrationType: type } }),
+      staleTime: 5 * 60 * 1000, // 5min - rarely changes during a session
+    }),
+
+  /**
+   * List all integrations (for integrations catalog)
+   */
+  integrations: () =>
+    queryOptions({
+      queryKey: ['admin', 'integrations'],
+      queryFn: () => fetchIntegrationsList(),
+      staleTime: 1 * 60 * 1000, // 1min - integration status can change
+    }),
+
+  /**
+   * Get a single integration by type with event mappings and platform credential info
+   */
+  integrationByType: (type: string) =>
+    queryOptions({
+      queryKey: ['admin', 'integrations', type],
+      queryFn: () => fetchIntegrationByType({ data: { type } }),
+      staleTime: 30 * 1000, // 30s - config may change frequently during setup
+    }),
+
+  /**
+   * Get post details by ID
+   * NOTE: Uses same query key as inboxKeys.detail() for cache consistency with mutations
+   *
+   * `withPanels` also loads, in the same request, the modal panels whose caches
+   * are empty or stale, and seeds each panel's own query with the result.
+   */
+  postDetail: (postId: PostId, options?: { withPanels?: boolean }) =>
+    queryOptions({
+      queryKey: ['inbox', 'detail', postId],
+      queryFn: async ({ client }) => {
+        const cached = client.getQueryData<{ authorEmail?: string | null }>([
+          'inbox',
+          'detail',
+          postId,
+        ])
+        const panels = options?.withPanels
+          ? readsToLoad(client, postPanelQueries(postId, cached?.authorEmail))
+          : []
+        const { panels: loaded, ...data } = await fetchPostWithDetails({
+          data: { id: postId, ...(panels.length > 0 ? { panels } : {}) },
+        })
+        if (loaded) seedReads(client, postPanelQueries(postId, data.authorEmail), loaded)
+        // Deserialize nested date strings from server response
+        type ServerComment = (typeof data.comments)[0]
+        type DeserializedComment = Omit<ServerComment, 'createdAt' | 'replies'> & {
+          createdAt: Date
+          replies: DeserializedComment[]
+        }
+        const deserializeComment = (c: ServerComment): DeserializedComment => ({
+          ...c,
+          createdAt: new Date(c.createdAt),
+          replies: c.replies.map(deserializeComment),
+        })
+        return {
+          ...data,
+          createdAt: new Date(data.createdAt),
+          updatedAt: new Date(data.updatedAt),
+          deletedAt: data.deletedAt ? new Date(data.deletedAt) : null,
+          eta: data.eta ? new Date(data.eta) : null,
+          summaryUpdatedAt: data.summaryUpdatedAt ? new Date(data.summaryUpdatedAt) : null,
+          comments: data.comments.map(deserializeComment),
+          pinnedComment: data.pinnedComment
+            ? { ...data.pinnedComment, createdAt: new Date(data.pinnedComment.createdAt) }
+            : null,
+        }
+      },
+      staleTime: 30 * 1000, // 30s - frequently updated
+    }),
+
+  /**
+   * Get voters for a post (admin/member only)
+   */
+  postVoters: (postId: PostId) =>
+    queryOptions({
+      queryKey: ['inbox', 'voters', postId],
+      queryFn: () => fetchPostVotersFn({ data: { id: postId } }),
+      staleTime: 30 * 1000,
+    }),
+
+  /**
+   * Preview what a merged post would look like (admin/member only)
+   */
+  mergePreview: (canonicalPostId: PostId, duplicatePostId: PostId) =>
+    queryOptions({
+      queryKey: ['inbox', 'merge-preview', canonicalPostId, duplicatePostId],
+      queryFn: async () => {
+        const data = await fetchMergePreviewFn({
+          data: { canonicalPostId, duplicatePostId },
+        })
+        // Deserialize nested date strings (same pattern as postDetail)
+        type ServerComment = (typeof data.post.comments)[0]
+        type DeserializedComment = Omit<ServerComment, 'createdAt' | 'replies'> & {
+          createdAt: Date
+          replies: DeserializedComment[]
+        }
+        const deserializeComment = (c: ServerComment): DeserializedComment => ({
+          ...c,
+          createdAt: new Date(c.createdAt),
+          replies: c.replies.map(deserializeComment),
+        })
+        return {
+          post: {
+            ...data.post,
+            createdAt: new Date(data.post.createdAt),
+            updatedAt: new Date(data.post.updatedAt),
+            deletedAt: data.post.deletedAt ? new Date(data.post.deletedAt) : null,
+            summaryUpdatedAt: data.post.summaryUpdatedAt
+              ? new Date(data.post.summaryUpdatedAt)
+              : null,
+            comments: data.post.comments.map(deserializeComment),
+            pinnedComment: data.post.pinnedComment
+              ? {
+                  ...data.post.pinnedComment,
+                  createdAt: new Date(data.post.pinnedComment.createdAt),
+                }
+              : null,
+          },
+          duplicateComments: data.duplicateComments.map(deserializeComment),
+          duplicatePostTitle: data.duplicatePostTitle,
+        }
+      },
+      staleTime: 30 * 1000,
+    }),
+
+  /**
+   * List all API keys
+   */
+  apiKeys: () =>
+    queryOptions({
+      queryKey: ['admin', 'api-keys'],
+      queryFn: async () => {
+        const data = await fetchApiKeys()
+        const keys = data.keys.map((k) => ({
+          ...k,
+          createdAt: new Date(k.createdAt),
+          lastUsedAt: k.lastUsedAt ? new Date(k.lastUsedAt) : null,
+          expiresAt: k.expiresAt ? new Date(k.expiresAt) : null,
+          revokedAt: k.revokedAt ? new Date(k.revokedAt) : null,
+        }))
+        return { keys, personalKeysEnabled: data.personalKeysEnabled }
+      },
+      staleTime: 30 * 1000, // 30s - may change when creating/revoking keys
+    }),
+
+  /**
+   * List all webhooks
+   */
+  webhooks: () =>
+    queryOptions({
+      queryKey: ['admin', 'webhooks'],
+      queryFn: async () => {
+        const data = await fetchWebhooks()
+        return data.map((w) => ({
+          ...w,
+          createdAt: new Date(w.createdAt),
+          updatedAt: new Date(w.updatedAt),
+          lastTriggeredAt: w.lastTriggeredAt ? new Date(w.lastTriggeredAt) : null,
+        }))
+      },
+      staleTime: 30 * 1000, // 30s - may change when creating/updating webhooks
+    }),
+
+  /**
+   * Auth provider credential status: which providers have credentials configured
+   */
+  authProviderStatus: () =>
+    queryOptions({
+      queryKey: ['admin', 'authProviderStatus'],
+      queryFn: () => fetchAuthProviderStatusFn(),
+      staleTime: 5 * 60 * 1000, // 5min - changes when credentials are saved/deleted
+    }),
+
+  /**
+   * Masked auth provider credentials for a credential type
+   */
+  authProviderCredentials: (credentialType: string) =>
+    queryOptions({
+      queryKey: ['admin', 'authProviderCredentials', credentialType],
+      queryFn: () => fetchAuthProviderCredentialsMaskedFn({ data: { credentialType } }),
+      staleTime: 5 * 60 * 1000,
+    }),
+
+  /**
+   * List all user attribute definitions
+   */
+  userAttributes: () =>
+    queryOptions({
+      queryKey: ['admin', 'userAttributes'],
+      queryFn: () => listUserAttributesFn(),
+      staleTime: 60 * 1000,
+    }),
+
+  /**
+   * List all company attribute definitions
+   */
+  companyAttributes: () =>
+    queryOptions({
+      queryKey: ['admin', 'companyAttributes'],
+      queryFn: () => listCompanyAttributesFn(),
+      staleTime: 60 * 1000,
+    }),
+
+  /**
+   * Recovery codes for the calling admin — metadata only. Generation
+   * is via a mutation, not this query.
+   */
+  recoveryCodes: () =>
+    queryOptions({
+      queryKey: ['admin', 'recoveryCodes'],
+      queryFn: () => listRecoveryCodesFn({ data: {} }),
+      staleTime: 30 * 1000,
+    }),
+
+  /**
+   * Moderation status: whether moderation is enabled + pending post count.
+   * Drives the conditional sidebar entry and its backlog badge.
+   */
+  moderationStatus: () =>
+    queryOptions({
+      queryKey: ['admin', 'moderationStatus'],
+      queryFn: () => getModerationStatus(),
+      staleTime: 30 * 1000, // 30s - count changes as posts are approved/rejected
+    }),
+
+  /**
+   * Paginated audit-log feed. Filters compose with AND. The query key
+   * includes the filters so distinct filter combinations are cached
+   * independently.
+   */
+  auditEvents: (filters: {
+    eventType?: string
+    actorEmail?: string
+    from?: string
+    to?: string
+    limit?: number
+    excludeEventTypes?: string[]
+  }) =>
+    queryOptions({
+      queryKey: ['admin', 'auditEvents', filters],
+      queryFn: () => listAuditEventsFn({ data: filters }),
+      // 30s — long enough for the page to feel stable; short enough
+      // that the next interaction reflects fresh writes.
+      staleTime: 30 * 1000,
+    }),
+}
+
+// Export filter types for external use
+export type { PortalUserListParams as PortalUserFilters }

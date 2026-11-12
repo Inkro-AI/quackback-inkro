@@ -1,0 +1,45 @@
+import { MapPinIcon } from '@heroicons/react/24/solid'
+import { FormattedMessage } from 'react-intl'
+import { Badge } from '@/components/ui/badge'
+import { Avatar } from '@/components/ui/avatar'
+import { TimeAgo } from '@/components/ui/time-ago'
+import { CommentContent } from '@/components/public/comment-content'
+import type { PinnedCommentView } from '@/lib/client/queries/portal-detail'
+
+interface PinnedCommentProps {
+  comment: PinnedCommentView
+  workspaceName: string
+}
+
+export function PinnedComment({ comment, workspaceName }: PinnedCommentProps) {
+  return (
+    <div className="[border-radius:var(--radius)] border border-primary/20 bg-primary/5 p-4">
+      <div className="flex items-start gap-3">
+        <Avatar
+          className="h-10 w-10 ring-2 ring-background shadow-md"
+          src={comment.avatarUrl}
+          name={comment.authorName}
+          fallbackClassName="text-sm bg-primary/20 text-primary font-semibold"
+        />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-2 flex-wrap">
+            <span className="text-sm font-semibold text-foreground">
+              {comment.authorName || workspaceName}
+            </span>
+            <Badge className="text-[11px] px-1.5 py-0 bg-primary/15 text-primary border-0">
+              <MapPinIcon className="h-2.5 w-2.5 me-0.5" />
+              <FormattedMessage id="portal.pinnedComment.pinnedBadge" defaultMessage="Pinned" />
+            </Badge>
+            <span className="text-muted-foreground">·</span>
+            <TimeAgo date={comment.createdAt} className="text-xs text-muted-foreground" />
+          </div>
+          <CommentContent
+            content={comment.content}
+            contentJson={comment.contentJson ?? null}
+            className="text-sm text-foreground/90 leading-relaxed"
+          />
+        </div>
+      </div>
+    </div>
+  )
+}

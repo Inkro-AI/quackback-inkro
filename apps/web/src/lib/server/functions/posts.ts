@@ -1,0 +1,753 @@
+/**
+ * Server functions for post operations
+ */
+
+import { z } from 'zod'
+import { createServerFn } from '@tanstack/react-start'
+import { getRequestHeaders } from '@tanstack/react-start/server'
+import {
+  type PostId,
+  type BoardId,
+  type PostStatusId,
+  type PostTagId,
+  type SegmentId,
+  type PrincipalId,
+  type UserId,
+} from '@quackback/ids'
+import { tiptapContentSchema, type TiptapContent } from '@/lib/shared/schemas/posts'
+import { PageLimitSchema } from '@/lib/shared/schemas/taxonomy'
+import { INBOX_POST_SORTS } from '@/lib/shared/types/filters'
+import { PERMISSIONS } from '@/lib/shared/permissions'
+import { sanitizeTiptapContent } from '@/lib/server/sanitize-tiptap'
+import { requireAuth, policyActorFromAuth } from './auth-helpers'
+import { can } from '@/lib/server/policy/authorize'
+import { db, eq, posts } from '@/lib/server/db'
+import { createActivity } from '@/lib/server/domains/activity/activity.service'
+import { getMemberById } from '@/lib/server/domains/principals/principal.service'
+import { createPost, updatePost } from '@/lib/server/domains/posts/post.service'
+import { countInboxFilterFacets } from '@/lib/server/domains/posts/post.inbox'
+import { withInboxSearchMode } from '@/lib/server/domains/posts/post.inbox.search'
+import { listAdminInboxPage } from '@/lib/server/domains/posts/post.admin-inbox'
+import {
+  getPostWithDetails,
+  getPaginatedCommentsWithReplies,
+} from '@/lib/server/domains/posts/post.query'
+import { changeStatus } from '@/lib/server/domains/posts/post.status'
+import { changeBoard } from '@/lib/server/domains/posts/post.board'
+import { softDeletePost, restorePost } from '@/lib/server/domains/posts/post.user-actions'
+import {
+  getPostExternalLinks,
+  executeCascadeDelete,
+} from '@/lib/server/domains/posts/post.cascade-delete'
+import { hasUserVoted } from '@/lib/server/domains/posts/post.public.utils'
+import { getMergedPosts, getPostMergeInfo } from '@/lib/server/domains/posts/post.merge'
+import { addVoteOnBehalf, removeVote } from '@/lib/server/domains/posts/post.voting'
+import {
+  ADMIN_POST_PANELS,
+  loadAdminPostPanels,
+  loadPostVotersPanel,
+} from '@/lib/server/domains/posts/post.admin-panels'
+import { toIsoString, toIsoStringOrNull } from '@/lib/shared/utils'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'posts' })
+
+/**
+ * Serialize common post date fields for API responses.
+ */
+function serializePostDates<
+  T extends {
+    createdAt: Date | string
+    updatedAt: Date | string
+    deletedAt?: Date | string | null
+    eta?: Date | string | null
+  },
+>(
+  post: T
+): Omit<T, 'createdAt' | 'updatedAt' | 'deletedAt' | 'eta'> & {
+  createdAt: string
+  updatedAt: string
+  deletedAt: string | null
+  eta: string | null
+} {
+  return {
+    ...post,
+    createdAt: toIsoString(post.createdAt),
+    updatedAt: toIsoString(post.updatedAt),
+    deletedAt: toIsoStringOrNull(post.deletedAt),
+    eta: toIsoStringOrNull(post.eta),
+  }
+}
+
+// ============================================
+// Schemas
+// ============================================
+
+// tiptapContentSchema imported from @/lib/shared/schemas/posts
+
+const listInboxPostsSchema = z.object({
+  boardIds: z.array(z.string()).optional(),
+  statusIds: z.array(z.string()).optional(),
+  statusSlugs: z.array(z.string()).optional(),
+  tagIds: z.array(z.string()).optional(),
+  segmentIds: z.array(z.string()).optional(),
+  ownerId: z.union([z.string(), z.null()]).optional(),
+  search: z.string().optional(),
+  dateFrom: z.string().optional(),
+  dateTo: z.string().optional(),
+  minVotes: z.number().int().min(0).optional(),
+  minComments: z.number().int().min(0).optional(),
+  responded: z.enum(['all', 'responded', 'unresponded']).optional(),
+  updatedBefore: z.string().optional(),
+  sort: z.enum(INBOX_POST_SORTS).optional().default('newest'),
+  showDeleted: z.boolean().optional(),
+  /** The page shows only posts with pending duplicates; the search widens within them. */
+  hasDuplicates: z.boolean().optional(),
+  cursor: z.string().optional(),
+  limit: z.number().int().min(1).max(100).optional().default(20),
+})
+
+const inboxFilterCountsSchema = listInboxPostsSchema.omit({
+  cursor: true,
+  limit: true,
+  sort: true,
+})
+
+const createPostSchema = z.object({
+  title: z.string().min(1, 'Title is required').max(200),
+  content: z.string().max(10000).optional().default(''),
+  contentJson: tiptapContentSchema.optional(),
+  boardId: z.string(),
+  statusId: z.string().optional(),
+  tagIds: z.array(z.string()).optional().default([]),
+  authorPrincipalId: z.string().optional(),
+})
+
+const getPostSchema = z.object({
+  id: z.string(),
+})
+
+const updatePostSchema = z.object({
+  id: z.string(),
+  title: z.string().min(1).max(200).optional(),
+  content: z.string().max(10000).optional(),
+  contentJson: tiptapContentSchema.optional(),
+  pinned: z.boolean().optional(),
+})
+
+const setPostOwnerSchema = z.object({
+  id: z.string(),
+  ownerId: z.string().nullable(),
+})
+
+const setPostEtaSchema = z.object({
+  id: z.string(),
+  // ISO datetime (first of the target month) or null to clear.
+  eta: z.string().datetime().nullable(),
+})
+
+const deletePostSchema = z.object({
+  id: z.string(),
+  cascadeChoices: z
+    .array(
+      z.object({
+        linkId: z.string(),
+        shouldArchive: z.boolean(),
+      })
+    )
+    .optional(),
+})
+
+const changeStatusSchema = z.object({
+  id: z.string(),
+  statusId: z.string(),
+})
+
+const changePostBoardSchema = z.object({
+  id: z.string(),
+  boardId: z.string(),
+})
+
+const updateTagsSchema = z.object({
+  id: z.string(),
+  tagIds: z.array(z.string()),
+})
+
+const restorePostSchema = z.object({
+  id: z.string(),
+})
+
+const toggleCommentsLockSchema = z.object({
+  id: z.string(),
+  locked: z.boolean(),
+})
+
+const retryPostIntegrationSyncSchema = z.object({
+  id: z.string(),
+})
+
+// ============================================
+// Type Exports
+// ============================================
+
+export type ListInboxPostsInput = z.infer<typeof listInboxPostsSchema>
+export type CreatePostInput = z.infer<typeof createPostSchema>
+export type GetPostInput = z.infer<typeof getPostSchema>
+export type UpdatePostInput = z.infer<typeof updatePostSchema>
+export type DeletePostInput = z.infer<typeof deletePostSchema>
+export type ChangeStatusInput = z.infer<typeof changeStatusSchema>
+export type UpdateTagsInput = z.infer<typeof updateTagsSchema>
+export type RestorePostInput = z.infer<typeof restorePostSchema>
+
+// ============================================
+// Read Operations
+// ============================================
+
+/**
+ * List inbox posts with filtering, sorting, and pagination
+ */
+export const fetchInboxPostsForAdmin = createServerFn({ method: 'GET' })
+  .validator(listInboxPostsSchema)
+  .handler(async ({ data }) => {
+    log.debug('fetch inbox posts for admin')
+    await requireAuth({ permission: PERMISSIONS.POST_VIEW_PRIVATE })
+
+    const result = await listAdminInboxPage(
+      {
+        boardIds: data.boardIds as BoardId[] | undefined,
+        statusIds: data.statusIds as PostStatusId[] | undefined,
+        statusSlugs: data.statusSlugs,
+        tagIds: data.tagIds as PostTagId[] | undefined,
+        segmentIds: data.segmentIds as SegmentId[] | undefined,
+        ownerId: data.ownerId as PrincipalId | null | undefined,
+        search: data.search,
+        dateFrom: data.dateFrom ? new Date(data.dateFrom) : undefined,
+        dateTo: data.dateTo ? new Date(data.dateTo) : undefined,
+        minVotes: data.minVotes,
+        minComments: data.minComments,
+        responded: data.responded,
+        updatedBefore: data.updatedBefore ? new Date(data.updatedBefore) : undefined,
+        sort: data.sort,
+        showDeleted: data.showDeleted,
+        cursor: data.cursor,
+        limit: data.limit,
+      },
+      { pendingDuplicates: data.hasDuplicates }
+    )
+    log.debug(
+      { count: result.items.length, cursor: data.cursor ?? 'none' },
+      'fetched inbox posts for admin'
+    )
+    return {
+      ...result,
+      items: result.items.map((p) => ({
+        ...serializePostDates(p),
+        contentJson: (p.contentJson ?? {}) as TiptapContent,
+      })),
+    }
+  })
+
+/**
+ * Facet counts for the admin inbox filter pane. Same filter shape as the
+ * list, minus pagination/sort. Each dimension omits its own filter so the
+ * count next to an option is "currently applied filters + posts that would
+ * newly match this option".
+ */
+export const fetchInboxFilterCounts = createServerFn({ method: 'GET' })
+  .validator(inboxFilterCountsSchema)
+  .handler(async ({ data }) => {
+    await requireAuth({ permission: PERMISSIONS.POST_VIEW_PRIVATE })
+    const params = await withInboxSearchMode(
+      {
+        boardIds: data.boardIds as BoardId[] | undefined,
+        statusIds: data.statusIds as PostStatusId[] | undefined,
+        statusSlugs: data.statusSlugs,
+        tagIds: data.tagIds as PostTagId[] | undefined,
+        segmentIds: data.segmentIds as SegmentId[] | undefined,
+        ownerId: data.ownerId as PrincipalId | null | undefined,
+        search: data.search,
+        dateFrom: data.dateFrom ? new Date(data.dateFrom) : undefined,
+        dateTo: data.dateTo ? new Date(data.dateTo) : undefined,
+        minVotes: data.minVotes,
+        minComments: data.minComments,
+        responded: data.responded,
+        updatedBefore: data.updatedBefore ? new Date(data.updatedBefore) : undefined,
+        showDeleted: data.showDeleted,
+      },
+      { pendingDuplicates: data.hasDuplicates }
+    )
+    return countInboxFilterFacets(params)
+  })
+
+/**
+ * Get a single post with full details including comments
+ */
+export const fetchPostWithDetails = createServerFn({ method: 'GET' })
+  .validator(
+    getPostSchema.extend({
+      // Comment keyset-page controls. First-page callers omit them (default
+      // page size); "show more" fetches pass the prior page's nextCursor.
+      commentsCursor: z.string().nullish(),
+      commentsLimit: PageLimitSchema,
+      // Admin modal panels to load with the post (see post.admin-panels).
+      panels: z.array(z.enum(ADMIN_POST_PANELS)).optional(),
+    })
+  )
+  .handler(async ({ data }) => {
+    log.debug({ post_id: data.id }, 'fetch post with details')
+    const auth = await requireAuth({ permission: PERMISSIONS.POST_VIEW_PRIVATE })
+
+    const postId = data.id as PostId
+
+    const [result, commentsPage, voted, panels, mergedPosts] = await Promise.all([
+      getPostWithDetails(postId),
+      getPaginatedCommentsWithReplies(postId, {
+        principalId: auth.principal.id,
+        cursor: data.commentsCursor ?? null,
+        limit: data.commentsLimit,
+      }),
+      hasUserVoted(postId, auth.principal.id),
+      data.panels?.length && !data.commentsCursor
+        ? loadAdminPostPanels(postId, data.panels, auth.permissions)
+        : undefined,
+      // Posts merged into this one (the admin Unmerge list).
+      getMergedPosts(postId).then((posts) =>
+        posts.map((p) => ({
+          ...p,
+          createdAt: toIsoString(p.createdAt),
+          mergedAt: toIsoString(p.mergedAt),
+        }))
+      ),
+    ])
+    const comments = commentsPage.comments
+    log.debug(
+      { post_id: data.id, found: !!result, comment_count: comments.length, has_voted: voted },
+      'fetched post with details'
+    )
+
+    // Serialize Date fields in comments
+    type SerializedComment = Omit<(typeof comments)[0], 'createdAt' | 'replies'> & {
+      createdAt: string
+      replies: SerializedComment[]
+    }
+    const serializeComment = (comment: (typeof comments)[0]): SerializedComment => ({
+      ...comment,
+      createdAt: toIsoString(comment.createdAt),
+      replies: comment.replies.map(serializeComment),
+    })
+
+    // Serialize pinned comment dates
+    const serializedPinnedComment = result.pinnedComment
+      ? {
+          ...result.pinnedComment,
+          createdAt: toIsoString(result.pinnedComment.createdAt),
+        }
+      : null
+
+    // Merge info (the banner on a post merged into another). The admin
+    // handler is team-gated, so the resolved actor is admin or member, and
+    // both pass canViewPost on any audience. Without the actor though,
+    // getPostMergeInfo defaulted to ANONYMOUS_ACTOR and hid the merge
+    // banner for canonicals on restricted-audience boards.
+    const mergeInfo = result.canonicalPostId
+      ? await getPostMergeInfo(postId, await policyActorFromAuth(auth)).then((info) =>
+          info ? { ...info, mergedAt: toIsoString(info.mergedAt) } : null
+        )
+      : null
+
+    return {
+      ...serializePostDates(result),
+      summaryUpdatedAt: toIsoStringOrNull(result.summaryUpdatedAt),
+      hasVoted: voted,
+      comments: comments.map(serializeComment),
+      commentsHasMore: commentsPage.hasMore,
+      commentsNextCursor: commentsPage.nextCursor,
+      commentsTotalRootCount: commentsPage.totalRootCount,
+      pinnedComment: serializedPinnedComment,
+      canonicalPostId: result.canonicalPostId,
+      mergedAt: toIsoStringOrNull(result.mergedAt),
+      mergedPosts: mergedPosts.length > 0 ? mergedPosts : undefined,
+      mergeInfo,
+      panels,
+    }
+  })
+
+/**
+ * Get voters for a post (admin/member only)
+ */
+export const fetchPostVotersFn = createServerFn({ method: 'GET' })
+  .validator(z.object({ id: z.string() }))
+  .handler(async ({ data }) => {
+    await requireAuth({ permission: PERMISSIONS.POST_VIEW_PRIVATE })
+    return loadPostVotersPanel(data.id as PostId)
+  })
+
+// ============================================
+// Write Operations
+// ============================================
+
+/**
+ * Create a new post
+ */
+export const createPostFn = createServerFn({ method: 'POST' })
+  .validator(createPostSchema)
+  .handler(async ({ data }) => {
+    log.info({ board_id: data.boardId }, 'create post')
+    const auth = await requireAuth({ permission: PERMISSIONS.POST_CREATE })
+    // Caller is always team — the policy gate inside createPost bypasses
+    // approval for team via canCreatePost. We still build the actor to
+    // pass through so audience checks are correct (e.g. a non-team API
+    // path wouldn't get here at all).
+    const actor = await policyActorFromAuth(auth)
+
+    // Resolve author: use specified principal or fall back to authenticated user
+    let author: {
+      principalId: PrincipalId
+      userId?: UserId
+      name?: string
+      email?: string
+      actor?: typeof actor
+    } = {
+      principalId: auth.principal.id,
+      userId: auth.user.id as UserId,
+      name: auth.user.name,
+      email: auth.user.email,
+      actor,
+    }
+
+    if (
+      data.authorPrincipalId &&
+      data.authorPrincipalId !== auth.principal.id &&
+      can(actor, PERMISSIONS.POST_SET_AUTHOR)
+    ) {
+      const selectedPrincipal = await getMemberById(data.authorPrincipalId as PrincipalId)
+      if (selectedPrincipal) {
+        author = {
+          principalId: selectedPrincipal.id,
+          name: selectedPrincipal.displayName ?? undefined,
+          // Keep the actor of the *caller* (the admin), not the override
+          // target — policy decisions reflect who's doing the create.
+          actor,
+        }
+      }
+    }
+
+    const result = await createPost(
+      {
+        title: data.title,
+        content: data.content,
+        contentJson: data.contentJson ? sanitizeTiptapContent(data.contentJson) : undefined,
+        boardId: data.boardId as BoardId,
+        statusId: data.statusId as PostStatusId | undefined,
+        tagIds: data.tagIds as PostTagId[] | undefined,
+      },
+      author,
+      { headers: getRequestHeaders() }
+    )
+    log.info({ post_id: result.id }, 'post created')
+
+    // Events are now dispatched by the service layer
+
+    return serializePostDates(result)
+  })
+
+/**
+ * Update an existing post
+ */
+export const updatePostFn = createServerFn({ method: 'POST' })
+  .validator(updatePostSchema)
+  .handler(async ({ data }) => {
+    log.info({ post_id: data.id }, 'update post')
+    const auth = await requireAuth({ permission: PERMISSIONS.POST_EDIT })
+
+    const result = await updatePost(
+      data.id as PostId,
+      {
+        title: data.title,
+        content: data.content,
+        contentJson: data.contentJson ? sanitizeTiptapContent(data.contentJson) : undefined,
+        pinned: data.pinned,
+      },
+      {
+        principalId: auth.principal.id,
+        userId: auth.user.id as UserId,
+        email: auth.user.email,
+        displayName: auth.user.name,
+      }
+    )
+    log.info({ post_id: result.id }, 'post updated')
+    return serializePostDates(result)
+  })
+
+/**
+ * Set a post's owner (assignee). Split out of updatePostFn so the assignee
+ * picker gates on the granular post.set_owner rather than the coarse edit path.
+ */
+export const setPostOwnerFn = createServerFn({ method: 'POST' })
+  .validator(setPostOwnerSchema)
+  .handler(async ({ data }) => {
+    log.info({ post_id: data.id }, 'set post owner')
+    const auth = await requireAuth({ permission: PERMISSIONS.POST_SET_OWNER })
+
+    const result = await updatePost(
+      data.id as PostId,
+      { ownerPrincipalId: data.ownerId as PrincipalId | null },
+      {
+        principalId: auth.principal.id,
+        userId: auth.user.id as UserId,
+        email: auth.user.email,
+        displayName: auth.user.name,
+      }
+    )
+    log.info({ post_id: result.id }, 'post owner set')
+    return serializePostDates(result)
+  })
+
+/**
+ * Set or clear a post ETA (time-based roadmap). First enforcement of the
+ * reserved post.set_eta permission.
+ */
+export const setPostEtaFn = createServerFn({ method: 'POST' })
+  .validator(setPostEtaSchema)
+  .handler(async ({ data }) => {
+    log.info({ post_id: data.id }, 'set post eta')
+    const auth = await requireAuth({ permission: PERMISSIONS.POST_SET_ETA })
+
+    const result = await updatePost(
+      data.id as PostId,
+      { eta: data.eta ? new Date(data.eta) : null },
+      {
+        principalId: auth.principal.id,
+        userId: auth.user.id as UserId,
+        email: auth.user.email,
+        displayName: auth.user.name,
+      }
+    )
+    log.info({ post_id: result.id }, 'post eta set')
+    return serializePostDates(result)
+  })
+
+/**
+ * Delete a post (soft delete) with optional cascade archive/close of linked issues.
+ * Note: softDeletePost already dispatches post.deleted — no duplicate dispatch here.
+ */
+export const deletePostFn = createServerFn({ method: 'POST' })
+  .validator(deletePostSchema)
+  .handler(async ({ data }) => {
+    log.info({ post_id: data.id }, 'delete post')
+    const auth = await requireAuth({ permission: PERMISSIONS.POST_DELETE })
+    const postId = data.id as PostId
+
+    let cascadeResults: Awaited<ReturnType<typeof executeCascadeDelete>> = []
+    await softDeletePost(
+      postId,
+      {
+        principalId: auth.principal.id,
+        role: auth.principal.role,
+        userId: auth.user.id,
+      },
+      async (tx) => {
+        if (data.cascadeChoices?.length)
+          cascadeResults = await executeCascadeDelete(postId, data.cascadeChoices, {
+            executor: tx,
+            requestedBy: auth.principal.id,
+          })
+      }
+    )
+    log.info({ post_id: data.id }, 'post deleted')
+
+    return { id: data.id, cascadeResults }
+  })
+
+/**
+ * Fetch external links for a post (for cascade delete dialog)
+ */
+export const fetchPostExternalLinksFn = createServerFn({ method: 'GET' })
+  .validator(z.object({ id: z.string() }))
+  .handler(async ({ data }) => {
+    log.debug({ post_id: data.id }, 'fetch post external links')
+    await requireAuth({ permission: PERMISSIONS.POST_VIEW_PRIVATE })
+    const links = await getPostExternalLinks(data.id as PostId)
+    log.debug({ count: links.length }, 'fetch post external links result')
+    return links
+  })
+
+/**
+ * Retry integration delivery per destination and refresh supported linked issues.
+ * Does not republish the domain event or replay notification/AI/webhook sinks.
+ */
+export const retryPostIntegrationSyncFn = createServerFn({ method: 'POST' })
+  .validator(retryPostIntegrationSyncSchema)
+  .handler(async ({ data }) => {
+    const ctx = await requireAuth({ permission: PERMISSIONS.INTEGRATION_MANAGE })
+    const { syncPostIntegrations } = await import('@/lib/server/integrations/post-sync')
+    const { syncSourceForActor } = await import('@/lib/server/integrations/sync/eligibility')
+    const actor = await policyActorFromAuth(ctx)
+    if (!(await syncSourceForActor({ sourceType: 'post', sourceId: data.id }, actor)))
+      throw new Error('Post not found')
+    return syncPostIntegrations(data.id as PostId, actor.principalId ?? undefined)
+  })
+
+/**
+ * Change post status
+ */
+export const changePostStatusFn = createServerFn({ method: 'POST' })
+  .validator(changeStatusSchema)
+  .handler(async ({ data }) => {
+    log.info({ post_id: data.id, status_id: data.statusId }, 'change post status')
+    const auth = await requireAuth({ permission: PERMISSIONS.POST_SET_STATUS })
+
+    const result = await changeStatus(data.id as PostId, data.statusId as PostStatusId, {
+      principalId: auth.principal.id,
+      userId: auth.user.id as UserId,
+      email: auth.user.email,
+    })
+
+    // Events are dispatched by the service layer
+
+    log.info({ post_id: data.id, new_status: result.newStatus }, 'post status changed')
+    return serializePostDates(result)
+  })
+
+/**
+ * Move a post to a different board
+ */
+export const changePostBoardFn = createServerFn({ method: 'POST' })
+  .validator(changePostBoardSchema)
+  .handler(async ({ data }) => {
+    log.info({ post_id: data.id, board_id: data.boardId }, 'change post board')
+    const auth = await requireAuth({ permission: PERMISSIONS.POST_SET_BOARD })
+    const result = await changeBoard(data.id as PostId, data.boardId as BoardId, {
+      principalId: auth.principal.id,
+      userId: auth.user.id as UserId,
+      email: auth.user.email,
+      displayName: auth.user.name,
+    })
+    log.info({ post_id: data.id }, 'post board changed')
+    return serializePostDates(result)
+  })
+
+/**
+ * Restore a deleted post
+ */
+export const restorePostFn = createServerFn({ method: 'POST' })
+  .validator(restorePostSchema)
+  .handler(async ({ data }) => {
+    log.info({ post_id: data.id }, 'restore post')
+    const auth = await requireAuth({ permission: PERMISSIONS.POST_DELETE })
+
+    const result = await restorePost(data.id as PostId, auth.principal.id, auth.user.id)
+    log.info({ post_id: result.id }, 'post restored')
+    return serializePostDates(result)
+  })
+
+/**
+ * Update post tags
+ */
+export const updatePostTagsFn = createServerFn({ method: 'POST' })
+  .validator(updateTagsSchema)
+  .handler(async ({ data }) => {
+    log.info({ post_id: data.id, tag_count: data.tagIds.length }, 'update post tags')
+    const auth = await requireAuth({ permission: PERMISSIONS.POST_SET_TAGS })
+
+    await updatePost(
+      data.id as PostId,
+      {
+        tagIds: data.tagIds as PostTagId[],
+      },
+      {
+        principalId: auth.principal.id,
+        userId: auth.user.id as UserId,
+        email: auth.user.email,
+        displayName: auth.user.name,
+      }
+    )
+    log.info({ post_id: data.id }, 'post tags updated')
+    return { id: data.id }
+  })
+
+/**
+ * Proxy vote: admin votes on behalf of another user
+ */
+export const proxyVoteFn = createServerFn({ method: 'POST' })
+  .validator(z.object({ postId: z.string(), voterPrincipalId: z.string() }))
+  .handler(async ({ data }) => {
+    const auth = await requireAuth({ permission: PERMISSIONS.POST_VOTE_ON_BEHALF })
+    const postId = data.postId as PostId
+    const voterPrincipalId = data.voterPrincipalId as PrincipalId
+
+    const result = await addVoteOnBehalf(
+      postId,
+      voterPrincipalId,
+      { type: 'proxy', externalUrl: '' },
+      auth.principal.id
+    )
+
+    // Fire-and-forget activity if a new vote was actually inserted
+    if (result.voted) {
+      const voter = await getMemberById(voterPrincipalId)
+      createActivity({
+        postId,
+        principalId: auth.principal.id,
+        type: 'vote.proxy',
+        metadata: {
+          voterPrincipalId,
+          voterName: voter?.displayName ?? null,
+        },
+      })
+    }
+
+    return result
+  })
+
+/**
+ * Remove a vote: admin removes any user's vote from a post
+ */
+export const removeVoteFn = createServerFn({ method: 'POST' })
+  .validator(z.object({ postId: z.string(), voterPrincipalId: z.string() }))
+  .handler(async ({ data }) => {
+    const auth = await requireAuth({ permission: PERMISSIONS.POST_VOTE_ON_BEHALF })
+    const postId = data.postId as PostId
+    const voterPrincipalId = data.voterPrincipalId as PrincipalId
+
+    const result = await removeVote(postId, voterPrincipalId)
+
+    if (result.removed) {
+      const voter = await getMemberById(voterPrincipalId)
+      createActivity({
+        postId,
+        principalId: auth.principal.id,
+        type: 'vote.removed',
+        metadata: {
+          voterPrincipalId,
+          voterName: voter?.displayName ?? null,
+        },
+      })
+    }
+
+    return result
+  })
+
+/**
+ * Toggle comments lock on a post
+ */
+export const toggleCommentsLockFn = createServerFn({ method: 'POST' })
+  .validator(toggleCommentsLockSchema)
+  .handler(async ({ data }) => {
+    log.info({ post_id: data.id, locked: data.locked }, 'toggle comments lock')
+    const auth = await requireAuth({ permission: PERMISSIONS.POST_EDIT })
+
+    await db
+      .update(posts)
+      .set({ isCommentsLocked: data.locked })
+      .where(eq(posts.id, data.id as PostId))
+
+    createActivity({
+      postId: data.id as PostId,
+      principalId: auth.principal.id,
+      type: data.locked ? 'comments.locked' : 'comments.unlocked',
+    })
+
+    log.info({ post_id: data.id }, 'comments lock toggled')
+    return { id: data.id, isCommentsLocked: data.locked }
+  })

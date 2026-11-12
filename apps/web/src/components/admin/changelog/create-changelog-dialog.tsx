@@ -1,0 +1,256 @@
+import { useState, useCallback, useRef } from 'react'
+import { useKeyboardSubmit } from '@/lib/client/hooks/use-keyboard-submit'
+import { ModalFooter } from '@/components/shared/modal-footer'
+import { useForm } from 'react-hook-form'
+import { standardSchemaResolver } from '@hookform/resolvers/standard-schema'
+import { createChangelogSchema } from '@/lib/shared/schemas/changelog'
+import type { TiptapContent } from '@/lib/shared/schemas/posts'
+import { useCreateChangelog } from '@/lib/client/mutations/changelog'
+import { Dialog, DialogContent, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
+import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet'
+import { Button } from '@/components/ui/button'
+import { Cog6ToothIcon } from '@heroicons/react/24/solid'
+import { NewButton } from '@/components/shared/new-button'
+import { Form } from '@/components/ui/form'
+import { ChangelogFormFields } from './changelog-form-fields'
+import { ChangelogMetadataSidebar } from './changelog-metadata-sidebar'
+import type { PublishState } from '@/lib/shared/schemas/changelog'
+import type { JSONContent } from '@tiptap/react'
+import type { EditorDocument } from '@/components/ui/rich-text-editor'
+import type { PostId, ChangelogCategoryId, SegmentId } from '@quackback/ids'
+
+// Mobile-only version of the sidebar content for the sheet
+import { ChangelogMetadataSidebarContent } from './changelog-metadata-sidebar-content'
+
+interface CreateChangelogDialogProps {
+  onChangelogCreated?: () => void
+  /** Controlled open state. When provided, the built-in trigger button is hidden. */
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+}
+
+export function CreateChangelogDialog({
+  onChangelogCreated,
+  open: openProp,
+  onOpenChange,
+}: CreateChangelogDialogProps) {
+  const [internalOpen, setInternalOpen] = useState(false)
+  const isControlled = openProp !== undefined
+  const open = isControlled ? openProp : internalOpen
+  const [contentJson, setContentJson] = useState<JSONContent | null>(null)
+  const [linkedPostIds, setLinkedPostIds] = useState<PostId[]>([])
+  const [categoryIds, setCategoryIds] = useState<ChangelogCategoryId[]>([])
+  const [notify, setNotify] = useState(true)
+  const [segmentIds, setSegmentIds] = useState<SegmentId[]>([])
+  const [publishState, setPublishState] = useState<PublishState>({ type: 'draft' })
+  const [displayDateOverride, setDisplayDateOverride] = useState<Date | undefined>(undefined)
+  const [featuredImageUrl, setFeaturedImageUrl] = useState<string | null>(null)
+  const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false)
+  const createChangelogMutation = useCreateChangelog()
+  const createMutationRef = useRef(createChangelogMutation)
+  createMutationRef.current = createChangelogMutation
+
+  const form = useForm({
+    resolver: standardSchemaResolver(createChangelogSchema),
+    defaultValues: {
+      title: '',
+      content: '',
+      linkedPostIds: [] as string[],
+      publishState: { type: 'draft' as const },
+    },
+  })
+
+  const handleContentChange = useCallback(
+    (document: EditorDocument) => {
+      setContentJson(document.json())
+      form.setValue('content', document.markdown(), { shouldValidate: false, shouldDirty: true })
+      // Only drop a *failed* mutation. Resetting while a save is in flight
+      // detaches onSuccess, so the dialog would stay open after a successful
+      // create and a later Save could duplicate the entry.
+      if (createMutationRef.current.isError) {
+        createMutationRef.current.reset()
+      }
+    },
+    [form]
+  )
+
+  function handlePublishStateChange(state: PublishState) {
+    setPublishState(state)
+    if (state.type !== 'published') {
+      setDisplayDateOverride(undefined)
+    }
+  }
+
+  function handleDisplayDateChange(value: Date | undefined) {
+    if (value) {
+      setDisplayDateOverride(value)
+    }
+  }
+
+  function handleDisplayDateClear() {
+    setDisplayDateOverride(undefined)
+  }
+
+  function resetFormState() {
+    form.reset()
+    setContentJson(null)
+    setLinkedPostIds([])
+    setCategoryIds([])
+    setNotify(true)
+    setSegmentIds([])
+    setPublishState({ type: 'draft' })
+    setDisplayDateOverride(undefined)
+    setFeaturedImageUrl(null)
+    createChangelogMutation.reset()
+  }
+
+  const handleSubmit = form.handleSubmit((data) => {
+    createChangelogMutation.mutate(
+      {
+        title: data.title,
+        content: data.content,
+        contentJson: contentJson as TiptapContent | null,
+        linkedPostIds,
+        categoryIds,
+        publishState,
+        notify,
+        segmentIds,
+        ...(publishState.type === 'published' &&
+          displayDateOverride !== undefined && { displayDate: displayDateOverride }),
+        ...(featuredImageUrl !== null && { featuredImageUrl }),
+      },
+      {
+        onSuccess: () => {
+          handleOpenChange(false)
+          resetFormState()
+          onChangelogCreated?.()
+        },
+      }
+    )
+  })
+
+  function handleOpenChange(isOpen: boolean) {
+    if (isControlled) {
+      onOpenChange?.(isOpen)
+    } else {
+      setInternalOpen(isOpen)
+    }
+    if (!isOpen) {
+      resetFormState()
+    }
+  }
+
+  const handleKeyDown = useKeyboardSubmit(handleSubmit)
+
+  const getSubmitButtonText = () => {
+    if (createChangelogMutation.isPending) {
+      return publishState.type === 'published' ? 'Publishing...' : 'Saving...'
+    }
+    switch (publishState.type) {
+      case 'draft':
+        return 'Save draft'
+      case 'scheduled':
+        return 'Schedule'
+      case 'published':
+        return 'Publish now'
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      {!isControlled && (
+        <DialogTrigger asChild>
+          <NewButton noun="entry" />
+        </DialogTrigger>
+      )}
+      <DialogContent
+        className="w-[95vw] sm:w-[90vw] lg:max-w-5xl xl:max-w-6xl h-[85vh] p-0 gap-0 overflow-hidden flex flex-col"
+        onKeyDown={handleKeyDown}
+        showCloseButton={false}
+      >
+        <DialogTitle className="sr-only">Create changelog entry</DialogTitle>
+
+        <Form {...form}>
+          <form onSubmit={handleSubmit} className="flex flex-col h-full">
+            {/* Main content area - 2 column layout on desktop */}
+            <div className="flex flex-1 min-h-0">
+              {/* Left: Content editor */}
+              <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+                <ChangelogFormFields
+                  form={form}
+                  contentJson={contentJson}
+                  onContentChange={handleContentChange}
+                  error={
+                    createChangelogMutation.isError
+                      ? createChangelogMutation.error.message
+                      : undefined
+                  }
+                />
+              </div>
+
+              {/* Right: Metadata sidebar (desktop only) */}
+              <ChangelogMetadataSidebar
+                publishState={publishState}
+                onPublishStateChange={handlePublishStateChange}
+                linkedPostIds={linkedPostIds}
+                onLinkedPostsChange={setLinkedPostIds}
+                categoryIds={categoryIds}
+                onCategoriesChange={setCategoryIds}
+                notify={notify}
+                onNotifyChange={setNotify}
+                segmentIds={segmentIds}
+                onSegmentIdsChange={setSegmentIds}
+                displayDateValue={displayDateOverride}
+                onDisplayDateChange={handleDisplayDateChange}
+                onDisplayDateClear={handleDisplayDateClear}
+                featuredImageUrl={featuredImageUrl}
+                onFeaturedImageChange={setFeaturedImageUrl}
+              />
+            </div>
+
+            {/* Footer */}
+            <ModalFooter
+              onCancel={() => handleOpenChange(false)}
+              submitLabel={getSubmitButtonText()}
+              isPending={createChangelogMutation.isPending}
+            >
+              {/* Mobile settings button */}
+              <Sheet open={mobileSettingsOpen} onOpenChange={setMobileSettingsOpen}>
+                <SheetTrigger asChild>
+                  <Button type="button" variant="outline" size="sm" className="lg:hidden">
+                    <Cog6ToothIcon className="h-4 w-4 mr-1.5" />
+                    Settings
+                  </Button>
+                </SheetTrigger>
+                <SheetContent side="bottom" className="h-[70vh]">
+                  <SheetHeader>
+                    <SheetTitle>Entry settings</SheetTitle>
+                  </SheetHeader>
+                  <div className="py-4 overflow-y-auto">
+                    <ChangelogMetadataSidebarContent
+                      publishState={publishState}
+                      onPublishStateChange={handlePublishStateChange}
+                      linkedPostIds={linkedPostIds}
+                      onLinkedPostsChange={setLinkedPostIds}
+                      categoryIds={categoryIds}
+                      onCategoriesChange={setCategoryIds}
+                      notify={notify}
+                      onNotifyChange={setNotify}
+                      segmentIds={segmentIds}
+                      onSegmentIdsChange={setSegmentIds}
+                      displayDateValue={displayDateOverride}
+                      onDisplayDateChange={handleDisplayDateChange}
+                      onDisplayDateClear={handleDisplayDateClear}
+                      featuredImageUrl={featuredImageUrl}
+                      onFeaturedImageChange={setFeaturedImageUrl}
+                    />
+                  </div>
+                </SheetContent>
+              </Sheet>
+            </ModalFooter>
+          </form>
+        </Form>
+      </DialogContent>
+    </Dialog>
+  )
+}
