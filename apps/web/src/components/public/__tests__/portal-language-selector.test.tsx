@@ -90,7 +90,7 @@ async function chooseLanguage(name: string) {
   const trigger = screen.getByRole('button', { name: /^(Jazyk|Language)$/ })
   await waitFor(() => expect(trigger).not.toBeDisabled())
   fireEvent.click(trigger)
-  fireEvent.click(await screen.findByRole('menuitem', { name, exact: true }))
+  fireEvent.click(await screen.findByRole('menuitem', { name }))
 }
 
 describe('portal language selection', () => {
