@@ -190,7 +190,7 @@ export function PortalHeader({
     <DropdownMenuItem asChild>
       <a href="/inkro-source.html">
         <CodeBracketIcon className="me-2 h-4 w-4" />
-        <FormattedMessage id="portal.source.label" defaultMessage="Source code and license" />
+        <FormattedMessage id="portal.source.label" defaultMessage="Source code & license" />
       </a>
     </DropdownMenuItem>
   )
