@@ -13,7 +13,6 @@ const {
   mockSocial,
   mockResolveSole,
   mockHasAny,
-  mockHasDistinctSignup,
   mockInvalidateQueries,
   mockRemoveQueries,
   mockSignOut,
@@ -24,7 +23,6 @@ const {
   mockSocial: vi.fn(),
   mockResolveSole: vi.fn((): string | null => null),
   mockHasAny: vi.fn((): boolean => false),
-  mockHasDistinctSignup: vi.fn((): boolean => true),
   mockInvalidateQueries: vi.fn(() => Promise.resolve()),
   mockRemoveQueries: vi.fn(() => Promise.resolve()),
   mockSignOut: vi.fn(() => Promise.resolve()),
@@ -77,7 +75,6 @@ vi.mock('@/components/auth/auth-popover-context', () => ({
 vi.mock('@/components/auth/oauth-buttons', () => ({
   hasAnyPortalAuthMethod: () => mockHasAny(),
   resolveSoleOidcProvider: () => mockResolveSole(),
-  hasDistinctSignup: () => mockHasDistinctSignup(),
 }))
 
 vi.mock('@tanstack/react-query', () => ({
@@ -227,7 +224,6 @@ describe('PortalHeader — single-IdP redirect', () => {
     mockSocial.mockClear()
     mockHasAny.mockReturnValue(true) // the portal has a usable sign-in method
     mockResolveSole.mockReturnValue(null)
-    mockHasDistinctSignup.mockReturnValue(true)
   })
   afterEach(() => cleanup())
 
@@ -248,7 +244,7 @@ describe('PortalHeader — single-IdP redirect', () => {
   })
 })
 
-describe('PortalHeader — Sign up button visibility', () => {
+describe('PortalHeader — guest sign-in entry point', () => {
   beforeEach(() => {
     mockOpenAuthPopover.mockClear()
     mockHasAny.mockReturnValue(true)
@@ -256,15 +252,7 @@ describe('PortalHeader — Sign up button visibility', () => {
   })
   afterEach(() => cleanup())
 
-  it('shows both Log in and Sign up when sign-up is a distinct flow', () => {
-    mockHasDistinctSignup.mockReturnValue(true)
-    renderHeader({ userRole: null, isLoggedIn: false })
-    expect(screen.getByRole('button', { name: /log in/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /sign up/i })).toBeInTheDocument()
-  })
-
-  it('shows only Log in when sign-up would lead to the same form', () => {
-    mockHasDistinctSignup.mockReturnValue(false)
+  it('shows only Log in in the guest header', () => {
     renderHeader({ userRole: null, isLoggedIn: false })
     expect(screen.getByRole('button', { name: /log in/i })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /sign up/i })).toBeNull()
